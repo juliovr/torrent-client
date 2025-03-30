@@ -69,8 +69,10 @@ static int calculate_string_length()
 
     while (*tokenizer.current != ':') {
         tokenizer.current++;
+        tokenizer.size--;
     }
     tokenizer.current++;
+    tokenizer.size--;
 
     return string_length;
 }
@@ -81,8 +83,10 @@ static u64 get_number()
     
     while (*tokenizer.current != 'e') {
         tokenizer.current++;
+        tokenizer.size--;
     }
     tokenizer.current++;
+    tokenizer.size--;
 
     return num;
 }
@@ -129,7 +133,7 @@ enum TokenType {
     TOKEN_TYPE_NUMBER,
     TOKEN_TYPE_STRING,
 
-    TOKEN_TYPE_INVALID,
+    TOKEN_TYPE_COMPLETED,
 
     TOKEN_TYPE_COUNT,
 };
@@ -139,7 +143,7 @@ static char *get_token_type_name(TokenType type)
     switch (type) {
         case TOKEN_TYPE_NUMBER: return "TOKEN_TYPE_NUMBER";
         case TOKEN_TYPE_STRING: return "TOKEN_TYPE_STRING";
-        case TOKEN_TYPE_INVALID: return "TOKEN_TYPE_INVALID";
+        case TOKEN_TYPE_COMPLETED: return "TOKEN_TYPE_COMPLETED";
     }
 
     return "UNKNOWN";
@@ -157,16 +161,18 @@ struct Token {
 static Token get_token()
 {
     Token token = {0};
-    token.type = TOKEN_TYPE_INVALID;
+    token.type = TOKEN_TYPE_COMPLETED;
 
-    while (tokenizer.size--) {
+    while (tokenizer.size > 0) {
         char c = *tokenizer.current;
         switch (c) {
             case 'd': {
                 tokenizer.current++;
+                tokenizer.size--;
             } break;
             case 'i': {
                 tokenizer.current++;
+                tokenizer.size--;
                 
                 token.type = TOKEN_TYPE_NUMBER;
                 token.num_value = get_number();
@@ -175,6 +181,7 @@ static Token get_token()
             } break;
             case 'e': {
                 tokenizer.current++;
+                tokenizer.size--;
             } break;
             default: {
                 if (c >= '0' && c <= '9') {
@@ -183,6 +190,7 @@ static Token get_token()
                     token.string_value = new_string(tokenizer.current, string_length);
                     
                     tokenizer.current += string_length;
+                    tokenizer.size -= string_length;
 
                     return token;
                 } else {
@@ -215,8 +223,12 @@ static Torrent parse_torrent()
 {
     Torrent torrent = {0};
 
-    while (tokenizer.size--) {
+    while (tokenizer.size > 0) {
         Token name_token = get_token();
+        if (name_token.type == TOKEN_TYPE_COMPLETED) {
+            break;
+        }
+        
         check_token_type(name_token, TOKEN_TYPE_STRING);
 
         if (strncmp(name_token.string_value.characters, "announce", strlen("announce")) == 0) {
@@ -258,11 +270,10 @@ static Torrent parse_torrent()
             torrent.info.piece_length = value_token.num_value;
         }
         else if (strncmp(name_token.string_value.characters, "pieces", strlen("pieces")) == 0) {
-            break;
-            // Token value_token = get_token();
-            // check_token_type(value_token, TOKEN_TYPE_STRING);
-
-            // torrent.info.pieces = value_token.string_value;
+            Token value_token = get_token();
+            check_token_type(value_token, TOKEN_TYPE_STRING);
+            
+            torrent.info.pieces = value_token.string_value;
         }
     }
 
