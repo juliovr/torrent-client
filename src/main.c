@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <assert.h>
 
 #include <openssl/sha.h>
 
@@ -14,6 +15,8 @@ typedef int8_t  s8;
 typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
+
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
 typedef struct string string;
 struct string {
@@ -53,6 +56,7 @@ struct Torrent {
     string comment;
     string created_by;
     s32 creation_date;
+    u8 info_hash[SHA_DIGEST_LENGTH];
     Info info;
 };
 
@@ -89,43 +93,6 @@ static u64 get_number()
     tokenizer.size--;
 
     return num;
-}
-
-void print_bencoded()
-{
-    int ident = 0;
-    while (tokenizer.size--) {
-        char c = *tokenizer.current;
-        switch (c) {
-            case 'd': {
-                printf("Dictionary:\n");
-                ident += 4;
-                tokenizer.current++;
-            } break;
-            case 'i': {
-                tokenizer.current++;
-                u64 num = get_number();
-                print_ident(ident);
-                printf("%ld\n", num);
-            } break;
-            case 'e': {
-                ident -= 4;
-                tokenizer.current++;
-            } break;
-            default: {
-                if (c >= '0' && c <= '9') {
-                    int string_length = calculate_string_length();
-                    print_ident(ident);
-                    printf("%.*s\n", string_length, tokenizer.current);
-                    
-                    tokenizer.current += string_length;
-                } else {
-                    fprintf(stderr, "ERROR: char '%c' is not recognized\n", c);
-                    exit(1);
-                }
-            }
-        }
-    }
 }
 
 typedef enum TokenType TokenType;
@@ -253,6 +220,10 @@ static Torrent parse_torrent()
             torrent.creation_date = value_token.num_value;
         } else if (strncmp(name_token.string_value.characters, "info", strlen("info")) == 0) {
             torrent.info = (Info){0};
+
+            // TODO: maybe if I parse the bencoded the entire file beforehand this would be easier. To do later.
+            SHA1(tokenizer.current, tokenizer.size - 1 /* the last 'e' of the main dictionary*/, torrent.info_hash);
+            // torrent.info_pointer = tokenizer.current - 4;
         } else if (strncmp(name_token.string_value.characters, "length", strlen("length")) == 0) {
             Token value_token = get_token();
             check_token_type(value_token, TOKEN_TYPE_NUMBER);
@@ -280,6 +251,20 @@ static Torrent parse_torrent()
     return torrent;
 }
 
+static char *get_hash_as_string(u8 *hash, int hash_size, char *buffer, int buffer_size)
+{
+    assert(buffer_size == (hash_size*2));
+
+    for (int i = 0; i < hash_size; ++i) {
+        u8 byte = hash[i];
+        int buffer_index = (i*2);
+        sprintf(buffer + buffer_index, "%02X", byte);
+    }
+    
+    return buffer;
+}
+
+
 int main(int argc, char **argv)
 {
     char *filename = "test_data/kubuntu-24.04.2-desktop-amd64.iso.torrent";
@@ -291,18 +276,48 @@ int main(int argc, char **argv)
 
         u8 *content = (u8 *)malloc(size);
         fread(content, size, 1, file);
+        fclose(file);
 
         tokenizer.start = content;
         tokenizer.current = content;
         tokenizer.size = size;
-        // print_bencoded();
 
         Torrent torrent = parse_torrent();
 
-        fclose(file);
+        if (torrent.info.pieces.length % 20 != 0) {
+            fprintf(stderr, "ERROR: Malformed pieces, should be multiple of 20\n");
+            exit(1);
+        }
+
+        int i = 0;
+        int piece_count = 0;
+        while (i < torrent.info.pieces.length) {
+            while (++i % 20 != 0)
+                ;
+
+            piece_count++;
+
+        }
+        
+        printf("Pieces count = %d\n", piece_count);
+
+        size_t info_size = sizeof(torrent.info.length) + torrent.info.name.length + sizeof(torrent.info.piece_length) + torrent.info.pieces.length;
+        printf("Info size = %ld\n", info_size);
+
+        // char hash[SHA_DIGEST_LENGTH];
+        // char *result = SHA1(torrent.info_pointer, info_size, hash);
+        // printf("hash = %s\n", result);
+        char hash_buffer[SHA_DIGEST_LENGTH * 2];
+        get_hash_as_string(torrent.info_hash, sizeof(torrent.info_hash), hash_buffer, sizeof(hash_buffer));
+        printf("hash = %s\n", hash_buffer);
+
+
+        if (torrent.info.length != 0) {
+            // Single file
+            // TODO: create entire file upfront. Then, as the pieces are downloaded, put it in the right spot.
+        }
     }
 
-    
     //
     // SHA-1
     //
