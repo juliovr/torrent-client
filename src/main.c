@@ -5,6 +5,10 @@
 #include <assert.h>
 
 #include <openssl/sha.h>
+#include <openssl/rand.h>
+
+#include <curl/curl.h>
+
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -17,11 +21,12 @@ typedef int32_t s32;
 typedef int64_t s64;
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define MAX_URL_LENGTH 2048
 
 typedef struct string string;
 struct string {
     char *characters;
-    size_t length;
+    int length;
 };
 
 string new_string(char *characters, size_t length)
@@ -251,17 +256,15 @@ static Torrent parse_torrent()
     return torrent;
 }
 
-static char *get_hash_as_string(u8 *hash, int hash_size, char *buffer, int buffer_size)
+static void bytes_to_string(u8 *hash, int hash_size, char *dest, int dest_size)
 {
-    assert(buffer_size == (hash_size*2));
+    assert(dest_size == (hash_size*2));
 
     for (int i = 0; i < hash_size; ++i) {
         u8 byte = hash[i];
-        int buffer_index = (i*2);
-        sprintf(buffer + buffer_index, "%02X", byte);
+        int dest_index = (i*2);
+        sprintf(dest + dest_index, "%02X", byte);
     }
-    
-    return buffer;
 }
 
 
@@ -307,8 +310,10 @@ int main(int argc, char **argv)
         // char hash[SHA_DIGEST_LENGTH];
         // char *result = SHA1(torrent.info_pointer, info_size, hash);
         // printf("hash = %s\n", result);
-        char hash_buffer[SHA_DIGEST_LENGTH * 2];
-        get_hash_as_string(torrent.info_hash, sizeof(torrent.info_hash), hash_buffer, sizeof(hash_buffer));
+
+#define HASH_BUFFER_SIZE (SHA_DIGEST_LENGTH * 2)
+        char hash_buffer[HASH_BUFFER_SIZE];
+        bytes_to_string(torrent.info_hash, sizeof(torrent.info_hash), hash_buffer, HASH_BUFFER_SIZE);
         printf("hash = %s\n", hash_buffer);
 
 
@@ -316,6 +321,68 @@ int main(int argc, char **argv)
             // Single file
             // TODO: create entire file upfront. Then, as the pieces are downloaded, put it in the right spot.
         }
+
+
+
+        char peer_id_bytes[SHA_DIGEST_LENGTH];
+        if (RAND_bytes(peer_id_bytes, SHA_DIGEST_LENGTH) != 1) {
+            fprintf(stderr, "ERROR: creating peer id.\n");
+            exit(1);
+        }
+
+        char peer_id[HASH_BUFFER_SIZE];
+        bytes_to_string(peer_id_bytes, sizeof(peer_id_bytes), peer_id, sizeof(peer_id));
+
+        printf("peer_id = %s\n", peer_id);
+
+        char *url = (char *)malloc(MAX_URL_LENGTH);
+        // strncpy(url, torrent.announce.characters, torrent.announce.length);
+        snprintf(url, MAX_URL_LENGTH, "%.*s?info_hash=%.*s&peer_id=%.*s&port=%d&uploaded=0&downloaded=0&left=%ld",
+            torrent.announce.length, torrent.announce.characters, 
+            HASH_BUFFER_SIZE, hash_buffer, 
+            (int)sizeof(peer_id), peer_id,
+            6881, torrent.info.length);
+
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+        
+        CURL *curl = curl_easy_init();
+        if (curl) {
+            curl_easy_setopt(curl, CURLOPT_URL, url);
+            curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+
+            /*
+             * If you want to connect to a site who is not using a certificate that is
+             * signed by one of the certs in the CA bundle you have, you can skip the
+             * verification of the server's certificate. This makes the connection
+             * A LOT LESS SECURE.
+             *
+             * If you have a CA cert for the server stored someplace else than in the
+             * default bundle, then the CURLOPT_CAPATH option might come handy for
+             * you.
+             */
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+
+            /*
+             * If the site you are connecting to uses a different host name that what
+             * they have mentioned in their server certificate's commonName (or
+             * subjectAltName) fields, libcurl refuses to connect. You can skip this
+             * check, but it makes the connection insecure.
+             */
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+
+
+            /* Perform the request, res gets the return code */
+            CURLcode res = curl_easy_perform(curl);
+            /* Check for errors */
+            if (res != CURLE_OK) {
+                fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+            }
+        
+            /* always cleanup */
+            curl_easy_cleanup(curl);
+        }
+
+        curl_global_cleanup();
     }
 
     //
