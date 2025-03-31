@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -223,9 +224,16 @@ void parse_torrent(char *filename)
     // TODO: process the file here...
 }
 
-Bencode *get_by_key(Bencode *bencode, char *key)
+Bencode *get_by_key(BencodeDictionary *dictionary, char *search_key)
 {
-    
+    for (int i = 0; i < dictionary->n; ++i) {
+        BencodeString *key = (BencodeString *)dictionary->keys[i];
+        if (strncmp(key->chars, search_key, key->length) == 0) {
+            return dictionary->values[i];
+        }
+    }
+
+    return NULL;
 }
 
 void print_bencode(Bencode *bencode)
@@ -278,8 +286,11 @@ int main(int argc, char **argv)
 
         Bencode *bencode = decode();
         print_bencode(bencode);
-        // Bencode *value = get_by_key(bencode, "announce");
-        // printf("%s\n", )
+
+
+        printf("Searching for announce\n");
+        Bencode *value = get_by_key(bencode, "announce");
+        print_bencode(value);
 
         // if (torrent.info.pieces.length % 20 != 0) {
         //     fprintf(stderr, "ERROR: Malformed pieces, should be multiple of 20\n");
