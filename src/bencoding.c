@@ -2,6 +2,10 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <assert.h>
+
+#include <openssl/sha.h>
+#include <openssl/rand.h>
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -36,7 +40,10 @@ static void advance_by(Tokenizer *tokenizer, int n)
     tokenizer->size -= n;
 }
 
-Tokenizer tokenizer;
+typedef struct string {
+    char *chars;
+    int length;
+} string;
 
 #define MAX_KEYS 128 /* TODO: maybe get rid of this and do it dynamically */
 
@@ -49,32 +56,35 @@ typedef enum BencodeType {
 
 typedef struct Bencode {
     BencodeType type;
+    u8 *bencode_chars;
+    int bencode_size;
 } Bencode;
 
 typedef struct BencodeDictionary {
-    BencodeType type;
+    Bencode bencode;
     int n;
     Bencode *keys[MAX_KEYS];
     Bencode *values[MAX_KEYS];
 } BencodeDictionary;
 
 typedef struct BencodeList {
-    BencodeType type;
+    Bencode bencode;
     int n;
     Bencode *values[MAX_KEYS];
 } BencodeList;
 
 typedef struct BencodeNumber {
-    BencodeType type;
+    Bencode bencode;
     u64 value;
 } BencodeNumber;
 
 typedef struct BencodeString {
-    BencodeType type;
-    char *chars;
-    int length;
+    Bencode bencode;
+    string str;
 } BencodeString;
 
+
+static Tokenizer tokenizer;
 
 Bencode *decode();
 
@@ -91,9 +101,11 @@ static bool match(char expected)
 static Bencode *decode_dictionary()
 {
     BencodeDictionary *dictionary = (BencodeDictionary *)malloc(sizeof(BencodeDictionary));
-    dictionary->type = TYPE_DICTIONARY;
+    dictionary->bencode.type = TYPE_DICTIONARY;
     dictionary->n = 0;
 
+    u8 *start = tokenizer.current;
+    
     advance(&tokenizer); // Skip 'd'
     
     while (tokenizer.size > 0 && *tokenizer.current != 'e') {
@@ -115,15 +127,20 @@ static Bencode *decode_dictionary()
         exit(1);
     }
 
+    dictionary->bencode.bencode_chars = start;
+    dictionary->bencode.bencode_size = tokenizer.current - start;
+
     return (Bencode *)dictionary;
 }
 
 static Bencode *decode_list()
 {
     BencodeList *list = (BencodeList *)malloc(sizeof(BencodeList));
-    list->type = TYPE_LIST;
+    list->bencode.type = TYPE_LIST;
     list->n = 0;
 
+    u8 *start = tokenizer.current;
+    
     advance(&tokenizer); // Skip 'l'
 
     while (tokenizer.size > 0 && *tokenizer.current != 'e') {
@@ -138,13 +155,18 @@ static Bencode *decode_list()
         exit(1);
     }
 
+    list->bencode.bencode_chars = start;
+    list->bencode.bencode_size = tokenizer.current - start;
+
     return (Bencode *)list;
 }
 
 static Bencode *decode_number()
 {
     BencodeNumber *number = (BencodeNumber *)malloc(sizeof(BencodeNumber));
-    number->type = TYPE_NUMBER;
+    number->bencode.type = TYPE_NUMBER;
+
+    u8 *start = tokenizer.current;
 
     advance(&tokenizer); // Skip 'i'
 
@@ -160,28 +182,37 @@ static Bencode *decode_number()
 
     number->value = num;
 
+    number->bencode.bencode_chars = start;
+    number->bencode.bencode_size = tokenizer.current - start;
+
     return (Bencode *)number;
 }
 
 static Bencode *decode_string()
 {
     BencodeString *string = (BencodeString *)malloc(sizeof(BencodeString));
-    string->type = TYPE_STRING;
+    string->bencode.type = TYPE_STRING;
 
     int string_length = atoi(tokenizer.current);
+
+    u8 *start = tokenizer.current;
 
     while (tokenizer.size > 0 && *tokenizer.current != ':') {
         advance(&tokenizer);
     }
+
     if (!match(':')) {
         fprintf(stderr, "ERROR: Miss ':'\n");
         exit(1);
     }
 
-    string->chars = tokenizer.current;
-    string->length = string_length;
+    string->str.chars = tokenizer.current;
+    string->str.length = string_length;
 
     advance_by(&tokenizer, string_length);
+
+    string->bencode.bencode_chars = start;
+    string->bencode.bencode_size = tokenizer.current - start;
 
     return (Bencode *)string;
 }
@@ -211,33 +242,156 @@ Bencode *decode()
     }
 }
 
-void parse_torrent(char *filename)
-{
-    // TODO: read the file here
-    // TODO: create the tokenizer
-    Bencode *bencode = decode();
-    if (bencode->type != TYPE_DICTIONARY) {
-        fprintf(stderr, "ERROR: data should be a dictionary bencoded.\n");
-        exit(1);
-    }
-
-    // TODO: process the file here...
-}
-
 Bencode *get_by_key(BencodeDictionary *dictionary, char *search_key)
 {
-    for (int i = 0; i < dictionary->n; ++i) {
-        BencodeString *key = (BencodeString *)dictionary->keys[i];
-        if (strncmp(key->chars, search_key, key->length) == 0) {
-            return dictionary->values[i];
+    if (dictionary) {
+        for (int i = 0; i < dictionary->n; ++i) {
+            BencodeString *key = (BencodeString *)dictionary->keys[i];
+            if (strncmp(key->str.chars, search_key, key->str.length) == 0) {
+                return dictionary->values[i];
+            }
         }
     }
 
     return NULL;
 }
 
+
+
+static void bytes_to_string(u8 *hash, int hash_size, char *dest, int dest_size)
+{
+    // assert(dest_size == (hash_size*2));
+
+    for (int i = 0; i < hash_size; ++i) {
+        u8 byte = hash[i];
+        int dest_index = (i*2);
+        sprintf(dest + dest_index, "%02X", byte);
+    }
+}
+
+#define HASH_BUFFER_SIZE (SHA_DIGEST_LENGTH * 2)
+
+typedef struct Torrent {
+    string announce;
+    int port;
+    char peer_id[HASH_BUFFER_SIZE];
+    char info_hash[HASH_BUFFER_SIZE];
+    u64 length;
+} Torrent;
+
+
+void parse_torrent(char *filename)
+{
+    FILE *file = fopen(filename, "rb");
+    if (file) {
+        fseek(file, 0, SEEK_END);
+        int size = ftell(file);
+        fseek(file, 0, SEEK_SET);
+
+        u8 *content = (u8 *)malloc(size);
+        fread(content, size, 1, file);
+        fclose(file);
+
+
+        tokenizer.start = content;
+        tokenizer.current = content;
+        tokenizer.size = size;
+
+        Bencode *bencode = decode();
+        if (bencode->type != TYPE_DICTIONARY) {
+            fprintf(stderr, "ERROR: data should be a dictionary bencoded.\n");
+            exit(1);
+        }
+        
+        BencodeDictionary *dictionary = (BencodeDictionary *)bencode;
+
+        BencodeDictionary *info = (BencodeDictionary *)get_by_key(dictionary, "info");
+        if (info == NULL) {
+            fprintf(stderr, "ERROR: There is no info\n");
+            exit(1);
+        }
+    
+        BencodeString *pieces = (BencodeString *)get_by_key(info, "pieces");
+        if (pieces == NULL) {
+            fprintf(stderr, "ERROR: There are no pieces\n");
+            exit(1);
+        }
+
+        if (pieces->str.length % 20 != 0) {
+            fprintf(stderr, "ERROR: Malformed pieces, should be multiple of 20\n");
+            exit(1);
+        }
+
+        Torrent torrent = {
+            .announce = ((BencodeString *)get_by_key(dictionary, "announce"))->str,
+            .port = 6881,
+            .length = ((BencodeNumber *)get_by_key(info, "length"))->value,
+        };
+
+
+        char peer_id_bytes[SHA_DIGEST_LENGTH];
+        if (RAND_bytes(peer_id_bytes, SHA_DIGEST_LENGTH) != 1) {
+            fprintf(stderr, "ERROR: creating peer id.\n");
+            exit(1);
+        }
+
+        bytes_to_string(peer_id_bytes, sizeof(peer_id_bytes), torrent.peer_id, sizeof(torrent.peer_id));
+
+        printf("peer_id = %s\n", torrent.peer_id);
+
+        // printf("bencode announce = %.*s\n", ((BencodeString *)get_by_key(dictionary, "announce"))->bencode.bencode_size, ((BencodeString *)get_by_key(dictionary, "announce"))->bencode.bencode_chars);
+        // printf("bencode creation_date = %.*s\n", ((BencodeNumber *)get_by_key(dictionary, "creation date"))->bencode.bencode_size, ((BencodeNumber *)get_by_key(dictionary, "creation date"))->bencode.bencode_chars);
+        // printf("bencode info size = %d\n", info->bencode.bencode_size);
+        // printf("bencode info = %.*s\n", info->bencode.bencode_size, info->bencode.bencode_chars);
+
+        u8 info_hash[SHA_DIGEST_LENGTH];
+        SHA1(info->bencode.bencode_chars, info->bencode.bencode_size, info_hash);
+        
+        bytes_to_string(info_hash, sizeof(info_hash), torrent.info_hash, HASH_BUFFER_SIZE);
+        printf("info_hash = %s\n", torrent.info_hash);
+
+
+        // printf("info bytes = \n");
+        // int byte_print = 3;
+        // for (int i = 0; i < byte_print; ++i) {
+        //     printf("   ");
+        // }
+        // for (int i = 0; i < info->bencode.bencode_size; ++i) {
+        //     if (byte_print % 16 == 0) {
+        //         printf("\n");
+        //     }
+
+        //     printf("%02X ", info->bencode.bencode_chars[i]);
+        //     byte_print++;
+        // }
+        // printf("\n");
+    }
+}
+
+
+/*
+Usage:
+
+Bencode *bencode = decode();
+print_bencode(bencode);
+
+printf("Searching for announce\n");
+print_bencode(get_by_key((BencodeDictionary *)bencode, "announce"));
+
+printf("Searching for name\n");
+BencodeDictionary *info = (BencodeDictionary *)get_by_key((BencodeDictionary *)bencode, "info");
+if (info == NULL) {
+    printf("Not found\n");
+} else {
+    print_bencode(get_by_key(info, "name"));
+}
+*/
 void print_bencode(Bencode *bencode)
 {
+    if (bencode == NULL) {
+        return;
+    }
+
     switch (bencode->type) {
         case TYPE_DICTIONARY: {
             BencodeDictionary *dictionary = (BencodeDictionary *)bencode;
@@ -258,7 +412,7 @@ void print_bencode(Bencode *bencode)
         } break;
         case TYPE_STRING: {
             BencodeString *string = (BencodeString *)bencode;
-            printf("%.*s\n", string->length, string->chars);
+            printf("%.*s\n", string->str.length, string->str.chars);
         } break;
         case TYPE_NUMBER: {
             BencodeNumber *number = (BencodeNumber *)bencode;
@@ -269,34 +423,10 @@ void print_bencode(Bencode *bencode)
 
 int main(int argc, char **argv)
 {
-    char *filename = "test_data/kubuntu-24.04.2-desktop-amd64.iso.torrent";
-    FILE *file = fopen(filename, "rb");
-    if (file) {
-        fseek(file, 0, SEEK_END);
-        int size = ftell(file);
-        fseek(file, 0, SEEK_SET);
-
-        u8 *content = (u8 *)malloc(size);
-        fread(content, size, 1, file);
-        fclose(file);
-
-        tokenizer.start = content;
-        tokenizer.current = content;
-        tokenizer.size = size;
-
-        Bencode *bencode = decode();
-        print_bencode(bencode);
-
-
-        printf("Searching for announce\n");
-        Bencode *value = get_by_key(bencode, "announce");
-        print_bencode(value);
-
-        // if (torrent.info.pieces.length % 20 != 0) {
-        //     fprintf(stderr, "ERROR: Malformed pieces, should be multiple of 20\n");
-        //     exit(1);
-        // }
-    }
+    // char *filename = "test_data/kubuntu-24.04.2-desktop-amd64.iso.torrent";
+    char *filename = "test_data/debian-12.10.0-amd64-netinst.iso.torrent";
+    parse_torrent(filename);
+    
 
     return 0;
 }
