@@ -269,13 +269,47 @@ static void bytes_to_string(u8 *hash, int hash_size, char *dest, int dest_size)
     }
 }
 
+// If every byte has to be escaped, would be %nn, where nn is the value of the hex byte. 
+// So, 1 byte, e.g. 0xAA, would the %AA (as string), which is 3 bytes.
+#define MAX_LENGTH_BYTES_ESCAPED(size) (size*3)
+
+static bool byte_should_be_escaped(u8 c)
+{
+    if (c >= '0' && c <= '9') return false;
+    if (c >= 'a' && c <= 'z') return false;
+    if (c >= 'A' && c <= 'Z') return false;
+    switch (c) {
+        case '.':
+        case '-':
+        case '_':
+        case '~':
+            return false;
+        default: return true;
+    }
+}
+
+static void bytes_to_string_escaped(u8 *hash, int hash_size, char *dest)
+{
+    int dest_index = 0;
+    for (int i = 0; i < hash_size; ++i) {
+        u8 byte = hash[i];
+        if (byte_should_be_escaped(byte)) {
+            sprintf(dest + dest_index, "%%%02X", byte);
+            dest_index += 3;
+        } else {
+            sprintf(dest + dest_index, "%c", byte);
+            dest_index++;
+        }
+    }
+}
+
 #define HASH_BUFFER_SIZE (SHA_DIGEST_LENGTH * 2)
 
 typedef struct Torrent {
     string announce;
     int port;
     char peer_id[HASH_BUFFER_SIZE];
-    char info_hash[HASH_BUFFER_SIZE];
+    char info_hash[SHA_DIGEST_LENGTH];
     u64 length;
 } Torrent;
 
@@ -339,32 +373,12 @@ void parse_torrent(char *filename)
 
         printf("peer_id = %s\n", torrent.peer_id);
 
-        // printf("bencode announce = %.*s\n", ((BencodeString *)get_by_key(dictionary, "announce"))->bencode.bencode_size, ((BencodeString *)get_by_key(dictionary, "announce"))->bencode.bencode_chars);
-        // printf("bencode creation_date = %.*s\n", ((BencodeNumber *)get_by_key(dictionary, "creation date"))->bencode.bencode_size, ((BencodeNumber *)get_by_key(dictionary, "creation date"))->bencode.bencode_chars);
-        // printf("bencode info size = %d\n", info->bencode.bencode_size);
-        // printf("bencode info = %.*s\n", info->bencode.bencode_size, info->bencode.bencode_chars);
 
-        u8 info_hash[SHA_DIGEST_LENGTH];
-        SHA1(info->bencode.bencode_chars, info->bencode.bencode_size, info_hash);
+        SHA1(info->bencode.bencode_chars, info->bencode.bencode_size, torrent.info_hash);
         
-        bytes_to_string(info_hash, sizeof(info_hash), torrent.info_hash, HASH_BUFFER_SIZE);
-        printf("info_hash = %s\n", torrent.info_hash);
-
-
-        // printf("info bytes = \n");
-        // int byte_print = 3;
-        // for (int i = 0; i < byte_print; ++i) {
-        //     printf("   ");
-        // }
-        // for (int i = 0; i < info->bencode.bencode_size; ++i) {
-        //     if (byte_print % 16 == 0) {
-        //         printf("\n");
-        //     }
-
-        //     printf("%02X ", info->bencode.bencode_chars[i]);
-        //     byte_print++;
-        // }
-        // printf("\n");
+        char info_hash_escaped[MAX_LENGTH_BYTES_ESCAPED(SHA_DIGEST_LENGTH)];
+        bytes_to_string_escaped(torrent.info_hash, sizeof(torrent.info_hash), info_hash_escaped);
+        printf("info_hash url encoded = %s\n", info_hash_escaped);
     }
 }
 
@@ -423,8 +437,8 @@ void print_bencode(Bencode *bencode)
 
 int main(int argc, char **argv)
 {
-    // char *filename = "test_data/kubuntu-24.04.2-desktop-amd64.iso.torrent";
-    char *filename = "test_data/debian-12.10.0-amd64-netinst.iso.torrent";
+    char *filename = "test_data/kubuntu-24.04.2-desktop-amd64.iso.torrent";
+    // char *filename = "test_data/debian-12.10.0-amd64-netinst.iso.torrent";
     parse_torrent(filename);
     
 
