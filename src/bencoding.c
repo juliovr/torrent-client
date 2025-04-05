@@ -4,6 +4,8 @@
 #include <string.h>
 #include <assert.h>
 
+#include <unistd.h>
+
 #include <openssl/sha.h>
 #include <openssl/rand.h>
 
@@ -583,7 +585,7 @@ typedef struct HandshakeData {
 
 } HandshakeData;
 
-#define PSTR_MAX_LENGTH 20
+
 int create_handshake_data(u8 *handshake_data, u8 *info_hash, int info_hash_size, char *peer_id, int peer_id_size)
 {
     char *pstr = "BitTorrent protocol";
@@ -611,11 +613,14 @@ int create_handshake_data(u8 *handshake_data, u8 *info_hash, int info_hash_size,
     return index;
 }
 
-void make_handshake(u8 *handshake_data, int handshake_data_size, string ip, int port)
+void make_handshake(u8 *handshake_data, int handshake_data_size)
 {
     printf("Making handshake...\n");
-    char url[MAX_URL_LENGTH];
-    snprintf(url, MAX_URL_LENGTH, "%.*s:%d", ip.length, ip.chars, port);
+    char url[21] = "130.44.171.228:61310";
+    // snprintf(url, MAX_URL_LENGTH, "%.*s:%d", ip.length, ip.chars, port);
+
+    fd_set ready_set;
+    FD_ZERO(&ready_set);
 
     CURL *curl = curl_easy_init();
     if (curl) {
@@ -624,25 +629,50 @@ void make_handshake(u8 *handshake_data, int handshake_data_size, string ip, int 
         /* Do not do the transfer - only connect to host */
         curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
         
+        printf("Connecting to: %s\n", url);
         res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
-            // char buf[256];
+            char buf[512];
             size_t sent;
+            size_t nread;
             long sockfd;
         
+            printf("Before\n");
             /* Extract the socket from the curl handle - we need it for waiting. */
             res = curl_easy_getinfo(curl, CURLINFO_ACTIVESOCKET, &sockfd);
+            printf("socket = %ld\n", sockfd);
         
+            FD_SET(sockfd, &ready_set);
+
             /* Send data */
+            printf("Sending data\n");
             res = curl_easy_send(curl, handshake_data, handshake_data_size, &sent);
             printf("Response code = %d\n", res);
+            printf("Data sent = %ld\n", sent);
+
+            while (1) {
+                select(sockfd + 1, &ready_set, NULL, NULL, NULL);
+                if (FD_ISSET(sockfd, &ready_set)) {
+                    /* Receive response */
+                    printf("Receiving data\n");
+                    res = curl_easy_recv(curl, buf, sizeof(buf), &nread);
+                    printf("Response code = %d\n", res);
+                    printf("Data received = %ld\n", nread);
+                    printf("Data = %.*s\n", (int)nread, buf);
+
+                    break;
+                }
+            }
+
+            printf("End\n");
+        } else {
+            printf("ERROR: curl response code = %d\n", res);
         }
+
+        curl_easy_cleanup(curl);
     }
 
     printf("Handshake completed\n");
-
-    // *** stack smashing detected ***: terminated
-    // make: *** [Makefile:12: run] Aborted (core dumped)
 }
 
 int main(int argc, char **argv)
@@ -662,12 +692,13 @@ int main(int argc, char **argv)
         printf("ip = %.*s:%d\n", peer.ip.length, peer.ip.chars, peer.port);
     }
 
-    u8 handshake_data[PSTR_MAX_LENGTH];
+    u8 handshake_data[128]; // TODO: make this dynamic
+    memset(handshake_data, 0, sizeof(handshake_data));
     int handshake_data_size = create_handshake_data(handshake_data, torrent.info_hash, sizeof(torrent.info_hash), torrent.peer_id, sizeof(torrent.peer_id));
     printf("handshake_data_size = %d\n", handshake_data_size);
     printf("handshake_data = %.*s\n", handshake_data_size, handshake_data);
     Peer peer = peers_list.peers[0];
-    make_handshake(handshake_data, handshake_data_size, peer.ip, peer.port);
+    make_handshake(handshake_data, handshake_data_size);
     
 
     return 0;
