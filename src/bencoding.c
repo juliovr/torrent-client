@@ -535,7 +535,7 @@ PeersList get_peers(Torrent *torrent)
 
         
         // printf("Response size = %ld\n", response.size);
-        printf("Response body = %s\n", response.body);
+        // printf("Response body = %s\n", response.body);
 
 
         Tokenizer tokenizer = create_tokenizer(response.body, response.size);
@@ -576,6 +576,69 @@ PeersList get_peers(Torrent *torrent)
     return result;
 }
 
+typedef struct TCPClient {
+    CURL *curl;
+    char *url;
+    bool connected;
+    long sockfd;
+    fd_set ready_set;
+} TCPClient;
+
+TCPClient new_tcp_client(char *url)
+{
+    CURL *curl = curl_easy_init();
+    
+    TCPClient client = {
+        .curl = curl,
+        .url = url,
+        .connected = false,
+    };
+
+    return client;
+}
+
+void tcp_client_connect(TCPClient *client)
+{
+    FD_ZERO(&client->ready_set);
+
+    curl_easy_setopt(client->curl, CURLOPT_URL, client->url);
+    /* Do not do the transfer - only connect to host */
+    curl_easy_setopt(client->curl, CURLOPT_CONNECT_ONLY, 1L);
+
+    CURLcode res;
+   
+    printf("Connecting to: %s\n", client->url);
+    res = curl_easy_perform(client->curl);
+    if (res != CURLE_OK) {
+        fprintf(stderr, "ERROR: curl response code = %d\n", res);
+        return;
+    }
+
+    /* Extract the socket from the curl handle - we need it for waiting. */
+    long sockfd;
+    res = curl_easy_getinfo(client->curl, CURLINFO_ACTIVESOCKET, &sockfd);
+    if (res != CURLE_OK || sockfd == CURL_SOCKET_BAD) {
+        fprintf(stderr, "ERROR: getting sockfd\n");
+        return;
+    }
+
+    printf("sockfd = %ld\n", sockfd);
+
+    client->connected = true;
+    client->sockfd = sockfd;
+}
+
+bool client_is_valid(TCPClient *client)
+{
+    return client && client->curl;
+}
+
+void tcp_client_cleanup(TCPClient *client)
+{
+    if (client_is_valid(client)) {
+        curl_easy_cleanup(client->curl);
+    }
+}
 
 /*
  * The handshake is a required message and must be the first message transmitted by the client. It is (49+len(pstr)) bytes long.
@@ -660,6 +723,64 @@ bool validate_handshake(HandshakeData *a, HandshakeData *b)
     return memcmp(a->info_hash, b->info_hash, sizeof(a->info_hash)) == 0;
 }
 
+void make_handshake(TCPClient *client, HandshakeData *handshake_data)
+{
+    printf("Making handshake...\n");
+    
+    FD_ZERO(&client->ready_set);
+
+    CURL *curl = client->curl;
+    if (curl && client->connected) {
+        CURLcode res;
+
+        /* Send data */
+        size_t sent;
+        u8 handshake_serialized[128]; // TODO: make this dynamic
+        memset(handshake_serialized, 0, sizeof(handshake_serialized));
+        int handshake_serialized_size = handshake_data_serialize(handshake_serialized, handshake_data);
+        res = curl_easy_send(curl, handshake_serialized, handshake_serialized_size, &sent);
+        if (res != CURLE_OK) {
+            fprintf(stderr, "ERROR: sending data making handshake\n");
+            return;
+        }
+
+        FD_SET(client->sockfd, &client->ready_set);
+        while (1) {
+            select(client->sockfd + 1, &client->ready_set, NULL, NULL, NULL); // TODO: add timeout to avoid infinite loop
+            if (FD_ISSET(client->sockfd, &client->ready_set)) {
+                /* Receive response */
+                char buf[512];
+                size_t nread;
+                res = curl_easy_recv(curl, buf, sizeof(buf), &nread);
+                if (res != CURLE_OK) {
+                    fprintf(stderr, "ERROR: getting handshake response\n");
+                    return;
+                }
+
+                printf("Data received = %ld\n", nread);
+                
+                HandshakeData handshake_response;
+                if (handshake_data_deserialize(&handshake_response, buf, nread)) {
+                    fprintf(stderr, "ERROR: parsing response\n");
+                    return;
+                }
+
+                if (validate_handshake(handshake_data, &handshake_response)) {
+                    printf("Handshake OK\n");
+                } else {
+                    fprintf(stderr, "ERROR: handshake validation failed\n");
+                }
+
+                handshake_data_cleanup(&handshake_response);
+                break;
+            }
+        }
+        FD_CLR(client->sockfd, &client->ready_set);
+
+        printf("Handshake completed\n");
+    }
+}
+
 typedef enum MessageID {
     MESSAGE_ID_CHOKE            = 0,
     MESSAGE_ID_UNCHOKE          = 1,
@@ -668,7 +789,14 @@ typedef enum MessageID {
     MESSAGE_ID_HAVE             = 4,
     MESSAGE_ID_BITFIELD         = 5,
     MESSAGE_ID_REQUEST          = 6,
+    MESSAGE_ID_PIECE            = 7,
+    MESSAGE_ID_CANCEL           = 8,
 } MessageID;
+
+typedef struct Message {
+    MessageID id;
+    u8 *payload;
+} Message;
 
 void parse_message(char *buf, int size)
 {
@@ -695,88 +823,11 @@ void parse_message(char *buf, int size)
     }
 }
 
-
-void make_handshake(HandshakeData *handshake_data, Peer *peer)
+void send_unchoke(TCPClient *client)
 {
-    printf("Making handshake...\n");
-    char url[21] = "130.44.171.228:61310"; // TODO: use peer's data
-    // snprintf(url, MAX_URL_LENGTH, "%.*s:%d", ip.length, ip.chars, port);
-
-    fd_set ready_set;
-    FD_ZERO(&ready_set);
-
-    CURL *curl = curl_easy_init();
-    if (curl) {
-        CURLcode res;
-        curl_easy_setopt(curl, CURLOPT_URL, url);
-        /* Do not do the transfer - only connect to host */
-        curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
-        
-        printf("Connecting to: %s\n", url);
-        res = curl_easy_perform(curl);
-        if (res != CURLE_OK) {
-            fprintf(stderr, "ERROR: curl response code = %d\n", res);
-            goto make_handshake_cleanup;
-        }
-
-        size_t sent;
-        long sockfd;
-        
-        /* Extract the socket from the curl handle - we need it for waiting. */
-        res = curl_easy_getinfo(curl, CURLINFO_ACTIVESOCKET, &sockfd);
-        if (res != CURLE_OK) {
-            fprintf(stderr, "ERROR: getting sockfd\n");
-            goto make_handshake_cleanup;
-        }
-
-        /* Send data */
-        u8 handshake_serialized[128]; // TODO: make this dynamic
-        memset(handshake_serialized, 0, sizeof(handshake_serialized));
-        int handshake_serialized_size = handshake_data_serialize(handshake_serialized, handshake_data);
-        res = curl_easy_send(curl, handshake_serialized, handshake_serialized_size, &sent);
-        if (res != CURLE_OK) {
-            fprintf(stderr, "ERROR: sending data making handshake\n");
-            goto make_handshake_cleanup;
-        }
-        
-        FD_SET(sockfd, &ready_set);
-        while (1) {
-            select(sockfd + 1, &ready_set, NULL, NULL, NULL); // TODO: add timeout to avoid infinite loop
-            if (FD_ISSET(sockfd, &ready_set)) {
-                /* Receive response */
-                char buf[512];
-                size_t nread;
-                res = curl_easy_recv(curl, buf, sizeof(buf), &nread);
-                if (res != CURLE_OK) {
-                    fprintf(stderr, "ERROR: getting handshake response\n");
-                    goto make_handshake_cleanup;
-                }
-
-                printf("Data received = %ld\n", nread);
-                
-                HandshakeData handshake_response;
-                if (handshake_data_deserialize(&handshake_response, buf, nread)) {
-                    fprintf(stderr, "ERROR: parsing response\n");
-                    goto make_handshake_cleanup;
-                }
-
-                if (validate_handshake(handshake_data, &handshake_response)) {
-                    printf("Handshake OK\n");
-                } else {
-                    fprintf(stderr, "ERROR: handshake validation failed\n");
-                }
-
-                handshake_data_cleanup(&handshake_response);
-                break;
-            }
-        }
-
-        printf("Handshake completed\n");
-
-make_handshake_cleanup:
-        curl_easy_cleanup(curl);
-    }
+    
 }
+
 
 int main(int argc, char **argv)
 {
@@ -791,16 +842,31 @@ int main(int argc, char **argv)
     printf("Piece length = %ld\n", torrent.piece_length);
 
     PeersList peers_list = get_peers(&torrent);
-    // printf("n_peers = %d\n", peers_list.n);
-    // for (int i = 0; i < peers_list.n; ++i) {
-    //     Peer peer = peers_list.peers[i];
-    //     printf("ip = %.*s:%d\n", peer.ip.length, peer.ip.chars, peer.port);
-    // }
+    printf("n_peers = %d\n", peers_list.n);
+    for (int i = 0; i < peers_list.n; ++i) {
+        Peer peer = peers_list.peers[i];
+        printf("ip = %.*s:%d\n", peer.ip.length, peer.ip.chars, peer.port);
+    }
 
     HandshakeData handshake_data = create_handshake_data(torrent.info_hash, torrent.peer_id);
     Peer peer = peers_list.peers[0];
-    make_handshake(&handshake_data, &peer); // TODO: create a thread for each peer and do the connection
+
+    char url[21] = "130.44.171.228:61310"; // TODO: use peer's data
+    // snprintf(url, MAX_URL_LENGTH, "%.*s:%d", ip.length, ip.chars, port);
     
+    TCPClient client = new_tcp_client(url);
+    if (!client_is_valid(&client)) {
+        fprintf(stderr, "ERROR: could not create client\n");
+        exit(2);
+    }
+
+    tcp_client_connect(&client);
+
+    make_handshake(&client, &handshake_data); // TODO: create a thread for each peer and do the connection
+
+    send_unchoke(&client);
+    
+    tcp_client_cleanup(&client);
 
     return 0;
 }
