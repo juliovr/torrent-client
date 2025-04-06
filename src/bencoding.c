@@ -617,7 +617,7 @@ void tcp_client_connect(TCPClient *client)
     /* Extract the socket from the curl handle - we need it for waiting. */
     long sockfd;
     res = curl_easy_getinfo(client->curl, CURLINFO_ACTIVESOCKET, &sockfd);
-    if (res != CURLE_OK || sockfd == CURL_SOCKET_BAD) {
+    if (res != CURLE_OK) {
         fprintf(stderr, "ERROR: getting sockfd\n");
         return;
     }
@@ -628,14 +628,14 @@ void tcp_client_connect(TCPClient *client)
     client->sockfd = sockfd;
 }
 
-bool client_is_valid(TCPClient *client)
+bool tcp_client_is_valid(TCPClient *client)
 {
     return client && client->curl;
 }
 
 void tcp_client_cleanup(TCPClient *client)
 {
-    if (client_is_valid(client)) {
+    if (tcp_client_is_valid(client)) {
         curl_easy_cleanup(client->curl);
     }
 }
@@ -855,7 +855,7 @@ int main(int argc, char **argv)
     // snprintf(url, MAX_URL_LENGTH, "%.*s:%d", ip.length, ip.chars, port);
     
     TCPClient client = new_tcp_client(url);
-    if (!client_is_valid(&client)) {
+    if (!tcp_client_is_valid(&client)) {
         fprintf(stderr, "ERROR: could not create client\n");
         exit(2);
     }
