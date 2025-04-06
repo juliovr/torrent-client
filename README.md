@@ -6,6 +6,7 @@ Tiny BitTorrent client to understand how it works by reading the [The BitTorrent
 - libcurl: sudo apt-get install libcurl4-nss-dev
 
 # TODO
+- Dealloc bencode decoded data.
 - Handle memory of Tokenizer when reading from file and get response from http request.
 
 # References
