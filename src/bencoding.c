@@ -580,16 +580,13 @@ typedef struct TCPClient {
     CURL *curl;
     char *url;
     bool connected;
-    long sockfd;
+    int sockfd;
     fd_set ready_set;
 } TCPClient;
 
 TCPClient new_tcp_client(char *url)
 {
-    CURL *curl = curl_easy_init();
-    
     TCPClient client = {
-        .curl = curl,
         .url = url,
         .connected = false,
     };
@@ -599,45 +596,49 @@ TCPClient new_tcp_client(char *url)
 
 void tcp_client_connect(TCPClient *client)
 {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
     FD_ZERO(&client->ready_set);
 
-    curl_easy_setopt(client->curl, CURLOPT_URL, client->url);
-    /* Do not do the transfer - only connect to host */
-    curl_easy_setopt(client->curl, CURLOPT_CONNECT_ONLY, 1L);
+    CURL *curl = curl_easy_init();
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
 
-    CURLcode res;
-   
-    printf("Connecting to: %s\n", client->url);
-    res = curl_easy_perform(client->curl);
-    if (res != CURLE_OK) {
-        fprintf(stderr, "ERROR: curl response code = %d\n", res);
-        return;
+        curl_easy_setopt(curl, CURLOPT_URL, client->url);
+        /* Do not do the transfer - only connect to host */
+        curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
+    
+        CURLcode res;
+       
+        printf("Connecting to: %s\n", client->url);
+        res = curl_easy_perform(curl);
+        if (res != CURLE_OK) {
+            fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+            return;
+        }
+    
+        /* Extract the socket from the curl handle - we need it for waiting. */
+        curl_socket_t sockfd;
+        res = curl_easy_getinfo(curl, CURLINFO_ACTIVESOCKET, &sockfd);
+        if (res != CURLE_OK) {
+            fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+            return;
+        }
+        printf("sockfd = %d\n", sockfd);
+
+        client->curl = curl;
+        client->connected = true;
+        client->sockfd = sockfd;
     }
-
-    /* Extract the socket from the curl handle - we need it for waiting. */
-    long sockfd;
-    res = curl_easy_getinfo(client->curl, CURLINFO_ACTIVESOCKET, &sockfd);
-    if (res != CURLE_OK) {
-        fprintf(stderr, "ERROR: getting sockfd\n");
-        return;
-    }
-
-    printf("sockfd = %ld\n", sockfd);
-
-    client->connected = true;
-    client->sockfd = sockfd;
-}
-
-bool tcp_client_is_valid(TCPClient *client)
-{
-    return client && client->curl;
 }
 
 void tcp_client_cleanup(TCPClient *client)
 {
-    if (tcp_client_is_valid(client)) {
+    if (client->curl) {
         curl_easy_cleanup(client->curl);
     }
+
+    curl_global_cleanup();
 }
 
 /*
@@ -842,11 +843,11 @@ int main(int argc, char **argv)
     printf("Piece length = %ld\n", torrent.piece_length);
 
     PeersList peers_list = get_peers(&torrent);
-    printf("n_peers = %d\n", peers_list.n);
-    for (int i = 0; i < peers_list.n; ++i) {
-        Peer peer = peers_list.peers[i];
-        printf("ip = %.*s:%d\n", peer.ip.length, peer.ip.chars, peer.port);
-    }
+    // printf("n_peers = %d\n", peers_list.n);
+    // for (int i = 0; i < peers_list.n; ++i) {
+    //     Peer peer = peers_list.peers[i];
+    //     printf("ip = %.*s:%d\n", peer.ip.length, peer.ip.chars, peer.port);
+    // }
 
     HandshakeData handshake_data = create_handshake_data(torrent.info_hash, torrent.peer_id);
     Peer peer = peers_list.peers[0];
@@ -855,11 +856,6 @@ int main(int argc, char **argv)
     // snprintf(url, MAX_URL_LENGTH, "%.*s:%d", ip.length, ip.chars, port);
     
     TCPClient client = new_tcp_client(url);
-    if (!tcp_client_is_valid(&client)) {
-        fprintf(stderr, "ERROR: could not create client\n");
-        exit(2);
-    }
-
     tcp_client_connect(&client);
 
     make_handshake(&client, &handshake_data); // TODO: create a thread for each peer and do the connection
