@@ -532,7 +532,7 @@ PeersList get_peers(Torrent *torrent)
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, response_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
-        
+
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
             fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
@@ -577,6 +577,8 @@ PeersList get_peers(Torrent *torrent)
     }
 
     curl_global_cleanup();
+
+    printf("Got peers\n");
 
     return result;
 }
@@ -752,12 +754,11 @@ typedef struct Message {
     u8 *payload;
 } Message;
 
-void parse_bitfield(u8 *buf, int size)
+Message *parse_message(u8 *buf, int size)
 {
-    printf("parse_bitfield\n");
     if (size == 0) {
         fprintf(stderr, "ERROR: size = 0\n");
-        return;
+        return NULL;
     }
 
     int length = FROM_BIG_ENDIAN(*(int *)buf);
@@ -767,18 +768,20 @@ void parse_bitfield(u8 *buf, int size)
 
     if (size < total_length) {
         fprintf(stderr, "ERROR: buffer size %d is less than the total length of the message %d\n", size, total_length);
-        return;
+        return NULL;
     }
     
     int id = *buf++;
-    if (id != MESSAGE_ID_BITFIELD) {
-        fprintf(stderr, "ERROR: id mismatch. Expected = %d, but got = %d\n", MESSAGE_ID_BITFIELD, id);
-        return;
-    }
     
-    int bitfield_length = length - 1; // Minus the ID
+    int payload_length = length - 1; // Minus the ID
+    u8 *payload = (u8 *)malloc(payload_length);
+    memcpy(payload, buf, payload_length);
 
+    Message *message = (Message *)malloc(sizeof(Message));
+    message->id = id;
+    message->payload = payload;
 
+    return message;
     
     // TODO: take this into consideration??
     // A bitfield of the wrong length is considered an error. 
@@ -786,7 +789,7 @@ void parse_bitfield(u8 *buf, int size)
     // or if the bitfield has any of the spare bits set.
 
 
-    
+
 
     // Make the connection to get the bitfield data, but it is already in the buffer while making the handshake, 
     // so just gather it from there.
@@ -820,105 +823,14 @@ void parse_bitfield(u8 *buf, int size)
     // FD_CLR(client->sockfd, &client->ready_set);
 }
 
-void make_handshake(TCPClient *client, HandshakeData *handshake_data)
+CURLcode send_data(TCPClient *client, u8 *data, int data_size)
 {
-    printf("Making handshake...\n");
-    
+    CURLcode res;
+
     FD_ZERO(&client->ready_set);
 
     CURL *curl = client->curl;
     if (client->connected) {
-        CURLcode res;
-
-        /* Send data */
-        size_t sent;
-        u8 handshake_serialized[128]; // TODO: make this dynamic
-        memset(handshake_serialized, 0, sizeof(handshake_serialized));
-        int handshake_serialized_size = handshake_data_serialize(handshake_serialized, handshake_data);
-        res = curl_easy_send(curl, handshake_serialized, handshake_serialized_size, &sent);
-        if (res != CURLE_OK) {
-            fprintf(stderr, "ERROR: sending data making handshake\n");
-            return;
-        }
-
-        FD_SET(client->sockfd, &client->ready_set);
-        while (1) {
-            select(client->sockfd + 1, &client->ready_set, NULL, NULL, NULL); // TODO: add timeout to avoid infinite loop
-            if (FD_ISSET(client->sockfd, &client->ready_set)) {
-                /* Receive response */
-                char buf[512];
-                size_t nread;
-                res = curl_easy_recv(curl, buf, sizeof(buf), &nread);
-                if (res != CURLE_OK) {
-                    fprintf(stderr, "ERROR: getting handshake response\n");
-                    fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
-                    return;
-                }
-
-                printf("Data received = %ld\n", nread);
-                
-                HandshakeData handshake_response;
-                if (handshake_data_deserialize(&handshake_response, buf, nread)) {
-                    fprintf(stderr, "ERROR: parsing response\n");
-                    return;
-                }
-
-                if (validate_handshake(handshake_data, &handshake_response)) {
-                    printf("Handshake OK\n");
-                } else {
-                    fprintf(stderr, "ERROR: handshake validation failed\n");
-                }
-
-                handshake_data_cleanup(&handshake_response);
-
-
-                u8 *bitfield_data = (buf + handshake_response.size);
-                parse_bitfield(bitfield_data, nread - handshake_response.size);
-
-                break;
-            }
-        }
-        FD_CLR(client->sockfd, &client->ready_set);
-
-        printf("Handshake completed\n");
-    }
-}
-
-
-void parse_message(char *buf, int size)
-{
-    u32 length = *((u32 *)buf);
-    u8 message_id = buf[4];
-    printf("length = %d\n", length);
-    printf("message_id = %d\n", message_id);
-    switch (message_id) {
-        case MESSAGE_ID_CHOKE: printf("MESSAGE_ID_CHOKE: length = %d\n", length); break;
-        case MESSAGE_ID_UNCHOKE: printf("MESSAGE_ID_UNCHOKE: length = %d\n", length); break;
-        case MESSAGE_ID_INTERESTED: printf("MESSAGE_ID_INTERESTED: length = %d\n", length); break;
-        case MESSAGE_ID_NOT_INTERESTED: printf("MESSAGE_ID_NOT_INTERESTED: length = %d\n", length); break;
-        case MESSAGE_ID_HAVE: printf("MESSAGE_ID_HAVE: length = %d\n", length); break;
-        case MESSAGE_ID_BITFIELD: printf("MESSAGE_ID_BITFIELD: length = %d\n", length); break;
-        case MESSAGE_ID_REQUEST: printf("MESSAGE_ID_REQUEST: length = %d\n", length); break;
-        default: {
-            if (length == 0) {
-                printf("MESSAGE_ID_KEEP_ALIVE\n");
-                break;
-            } else {
-                fprintf(stderr, "ERROR: Unknown message\n");
-            }
-        }
-    }
-}
-
-
-void send_data(TCPClient *client, u8 *data, int data_size)
-{
-    FD_ZERO(&client->ready_set);
-
-    CURL *curl = client->curl;
-    if (client->connected) {
-        CURLcode res;
-        
         FD_SET(client->sockfd, &client->ready_set);
         while (1) {
             select(client->sockfd + 1, NULL, &client->ready_set, NULL, NULL);
@@ -937,7 +849,80 @@ void send_data(TCPClient *client, u8 *data, int data_size)
     }
 
     FD_CLR(client->sockfd, &client->ready_set);
+
+    return res;
 }
+
+Message *make_handshake(TCPClient *client, HandshakeData *handshake_data)
+{
+    Message *bitfield = NULL;
+
+    printf("Making handshake...\n");
+    
+    FD_ZERO(&client->ready_set);
+
+    CURL *curl = client->curl;
+    if (client->connected) {
+        CURLcode res;
+
+        /* Send data */
+        u8 handshake_serialized[128]; // TODO: make this dynamic
+        memset(handshake_serialized, 0, sizeof(handshake_serialized));
+        int handshake_serialized_size = handshake_data_serialize(handshake_serialized, handshake_data);
+        // res = curl_easy_send(curl, handshake_serialized, handshake_serialized_size, &sent);
+        res = send_data(client, handshake_serialized, handshake_serialized_size);
+        if (res != CURLE_OK) {
+            return bitfield;
+        }
+
+        FD_SET(client->sockfd, &client->ready_set);
+        while (1) {
+            select(client->sockfd + 1, &client->ready_set, NULL, NULL, NULL); // TODO: add timeout to avoid infinite loop
+            if (FD_ISSET(client->sockfd, &client->ready_set)) {
+                /* Receive response */
+                char buf[512];
+                size_t nread;
+                res = curl_easy_recv(curl, buf, sizeof(buf), &nread);
+                if (res != CURLE_OK) {
+                    fprintf(stderr, "ERROR: getting handshake response\n");
+                    fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+                    return bitfield;
+                }
+
+                printf("Data received = %ld\n", nread);
+                
+                HandshakeData handshake_response;
+                if (handshake_data_deserialize(&handshake_response, buf, nread)) {
+                    fprintf(stderr, "ERROR: parsing response\n");
+                    return bitfield;
+                }
+
+                if (validate_handshake(handshake_data, &handshake_response)) {
+                    printf("Handshake OK\n");
+                } else {
+                    fprintf(stderr, "ERROR: handshake validation failed\n");
+                }
+
+                handshake_data_cleanup(&handshake_response);
+
+
+                u8 *bitfield_data = (buf + handshake_response.size);
+                bitfield = parse_message(bitfield_data, nread - handshake_response.size);
+                if (bitfield->id != MESSAGE_ID_BITFIELD) {
+                    fprintf(stderr, "ERROR: id mismatch. Expected = %d, but got = %d\n", MESSAGE_ID_BITFIELD, bitfield->id);
+                }
+
+                break;
+            }
+        }
+        FD_CLR(client->sockfd, &client->ready_set);
+
+        printf("Handshake completed\n");
+    }
+
+    return bitfield;
+}
+
 
 void send_unchoke(TCPClient *client)
 {
@@ -987,14 +972,19 @@ int main(int argc, char **argv)
     Peer peer = peers_list.peers[0];
 
     // TODO: create a thread for each peer and do the connection
-    char url[21] = "130.44.171.228:61310"; // TODO: use peer's data
-    // snprintf(url, MAX_URL_LENGTH, "%.*s:%d", ip.length, ip.chars, port);
+    char url[21] = "191.19.6.244:6881"; // TODO: use peer's data
+    // char url[MAX_URL_LENGTH];
+    // snprintf(url, MAX_URL_LENGTH, "%.*s:%d", peer.ip.length, peer.ip.chars, peer.port);
     
     TCPClient client = new_tcp_client(url);
     tcp_client_connect(&client);
 
-    make_handshake(&client, &handshake_data);
-
+    Message *bitfield = make_handshake(&client, &handshake_data);
+    if (bitfield == NULL) {
+        fprintf(stderr, "Got no bitfield from handshake\n");
+        exit(1);
+    }
+    
     send_unchoke(&client);
     send_interested(&client);
     
