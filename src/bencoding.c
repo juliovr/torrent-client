@@ -24,7 +24,16 @@ typedef int64_t s64;
 
 #define TO_BIG_ENDIAN(value)    ((((value) << 24) & 0xFF000000) | (((value) << 8) & 0xFF0000) | (((value) >> 8) & 0xFF00) | (((value) >> 24) & 0xFF))
 #define FROM_BIG_ENDIAN(value)  TO_BIG_ENDIAN(value) /* It's the same as converting to big endian, i.e. flip the bytes */
-
+#define PRINT_HEX(buf, size)            \
+do {                                    \
+    for (int i = 0; i < (size); ++i) {  \
+        if (i % 8 == 0) {               \
+            printf("\n");               \
+        }                               \
+        printf("%02X ", (buf)[i]);      \
+    }                                   \
+    printf("\n");                       \
+} while (0)
 
 #define MAX_URL_LENGTH 2048
 
@@ -937,6 +946,7 @@ Message *make_handshake(TCPClient *client, HandshakeData *handshake_data)
 void send_unchoke(TCPClient *client)
 {
     printf("Sending unchoke message\n");
+    
     int length = 1;
     
     u8 data[5];
@@ -949,6 +959,7 @@ void send_unchoke(TCPClient *client)
 void send_interested(TCPClient *client)
 {
     printf("Sending interested message\n");
+
     int length = 1;
 
     u8 data[5];
@@ -960,10 +971,8 @@ void send_interested(TCPClient *client)
 
 void download_piece(TCPClient *client, int piece_index, u32 piece_length)
 {
-
-
-    // Send request message
     printf("Sending request message\n");
+
     int length = 13;
     int byte_offset = 0;
 
@@ -975,6 +984,13 @@ void download_piece(TCPClient *client, int piece_index, u32 piece_length)
     *((u32 *)(data + 13)) = TO_BIG_ENDIAN(piece_length);
 
     send_data(client, data, sizeof(data));
+
+    char buf[262144];
+    size_t nread;
+    receive_data(client, buf, sizeof(buf), &nread);
+
+    printf("piece data:");
+    PRINT_HEX(buf, nread);
 }
 
 
@@ -1017,9 +1033,14 @@ int main(int argc, char **argv)
     send_unchoke(&client);
     send_interested(&client);
 
+    // printf("receiving data...\n");
+    // char buf[128];
+    // size_t nread;
+    // receive_data(&client, buf, sizeof(buf), &nread);
+
     // TODO: do the logic to get the piece_id from setted bitfields
-    // int piece_index = 0;
-    // download_piece(&client, piece_id, (u32)torrent.piece_length);
+    int piece_index = 0;
+    download_piece(&client, piece_index, (u32)torrent.piece_length);
     
     tcp_client_cleanup(&client);
 
