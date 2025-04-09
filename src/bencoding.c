@@ -855,72 +855,80 @@ CURLcode send_data(TCPClient *client, u8 *data, int data_size)
     return res;
 }
 
+CURLcode receive_data(TCPClient *client, char *buf, int buf_size, size_t *nread)
+{
+    CURLcode res;
+
+    FD_ZERO(&client->ready_set);
+
+    CURL *curl = client->curl;
+    if (client->connected) {
+        FD_SET(client->sockfd, &client->ready_set);
+        while (1) {
+            select(client->sockfd + 1, &client->ready_set, NULL, NULL, NULL);
+            if (FD_ISSET(client->sockfd, &client->ready_set)) {
+                res = curl_easy_recv(curl, buf, buf_size, nread);
+                if (res != CURLE_OK) {
+                    fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+                }
+
+                printf("Received = %ld\n", *nread);
+
+                break;
+            }
+        }
+    }
+
+    FD_CLR(client->sockfd, &client->ready_set);
+
+    return res;
+}
+
 Message *make_handshake(TCPClient *client, HandshakeData *handshake_data)
 {
     Message *bitfield = NULL;
 
     printf("Making handshake...\n");
     
-    FD_ZERO(&client->ready_set);
+    CURLcode res;
 
-    CURL *curl = client->curl;
-    if (client->connected) {
-        CURLcode res;
-
-        /* Send data */
-        u8 handshake_serialized[128]; // TODO: make this dynamic
-        memset(handshake_serialized, 0, sizeof(handshake_serialized));
-        int handshake_serialized_size = handshake_data_serialize(handshake_serialized, handshake_data);
-        // res = curl_easy_send(curl, handshake_serialized, handshake_serialized_size, &sent);
-        res = send_data(client, handshake_serialized, handshake_serialized_size);
-        if (res != CURLE_OK) {
-            return bitfield;
-        }
-
-        FD_SET(client->sockfd, &client->ready_set);
-        while (1) {
-            select(client->sockfd + 1, &client->ready_set, NULL, NULL, NULL); // TODO: add timeout to avoid infinite loop
-            if (FD_ISSET(client->sockfd, &client->ready_set)) {
-                /* Receive response */
-                char buf[512];
-                size_t nread;
-                res = curl_easy_recv(curl, buf, sizeof(buf), &nread);
-                if (res != CURLE_OK) {
-                    fprintf(stderr, "ERROR: getting handshake response\n");
-                    fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
-                    return bitfield;
-                }
-
-                printf("Data received = %ld\n", nread);
-                
-                HandshakeData handshake_response;
-                if (handshake_data_deserialize(&handshake_response, buf, nread)) {
-                    fprintf(stderr, "ERROR: parsing response\n");
-                    return bitfield;
-                }
-
-                if (validate_handshake(handshake_data, &handshake_response)) {
-                    printf("Handshake OK\n");
-                } else {
-                    fprintf(stderr, "ERROR: handshake validation failed\n");
-                }
-
-                handshake_data_cleanup(&handshake_response);
-
-
-                u8 *bitfield_data = (buf + handshake_response.size);
-                bitfield = parse_message(bitfield_data, nread - handshake_response.size);
-                if (bitfield->id != MESSAGE_ID_BITFIELD) {
-                    fprintf(stderr, "ERROR: id mismatch. Expected = %d, but got = %d\n", MESSAGE_ID_BITFIELD, bitfield->id);
-                }
-
-                break;
-            }
-        }
-        FD_CLR(client->sockfd, &client->ready_set);
-
-        printf("Handshake completed\n");
+    u8 handshake_serialized[128]; // TODO: make this dynamic
+    memset(handshake_serialized, 0, sizeof(handshake_serialized));
+    int handshake_serialized_size = handshake_data_serialize(handshake_serialized, handshake_data);
+    res = send_data(client, handshake_serialized, handshake_serialized_size);
+    if (res != CURLE_OK) {
+        return bitfield;
     }
+
+    char buf[512];
+    size_t nread;
+    res = receive_data(client, buf, sizeof(buf), &nread);
+    if (res != CURLE_OK) {
+        return bitfield;
+    }
+
+    HandshakeData handshake_response;
+    if (handshake_data_deserialize(&handshake_response, buf, nread)) {
+        fprintf(stderr, "ERROR: parsing response\n");
+        return bitfield;
+    }
+
+    if (validate_handshake(handshake_data, &handshake_response)) {
+        printf("Handshake OK\n");
+    } else {
+        fprintf(stderr, "ERROR: handshake validation failed\n");
+    }
+
+    
+    u8 *bitfield_data = (buf + handshake_response.size);
+    bitfield = parse_message(bitfield_data, nread - handshake_response.size);
+    if (bitfield->id != MESSAGE_ID_BITFIELD) {
+        fprintf(stderr, "ERROR: id mismatch. Expected = %d, but got = %d\n", MESSAGE_ID_BITFIELD, bitfield->id);
+    }
+
+    handshake_data_cleanup(&handshake_response);
+
+    printf("Handshake completed\n");
 
     return bitfield;
 }
@@ -928,7 +936,7 @@ Message *make_handshake(TCPClient *client, HandshakeData *handshake_data)
 
 void send_unchoke(TCPClient *client)
 {
-    printf("sending unchoke\n");
+    printf("Sending unchoke message\n");
     int length = 1;
     
     u8 data[5];
@@ -940,12 +948,31 @@ void send_unchoke(TCPClient *client)
 
 void send_interested(TCPClient *client)
 {
-    printf("sending interested\n");
+    printf("Sending interested message\n");
     int length = 1;
 
     u8 data[5];
     *((u32 *)data) = TO_BIG_ENDIAN(length);
     data[4] = MESSAGE_ID_INTERESTED;
+
+    send_data(client, data, sizeof(data));
+}
+
+void download_piece(TCPClient *client, int piece_index, u32 piece_length)
+{
+
+
+    // Send request message
+    printf("Sending request message\n");
+    int length = 13;
+    int byte_offset = 0;
+
+    u8 data[17];
+    *((u32 *)data) = TO_BIG_ENDIAN(length);
+    data[4] = MESSAGE_ID_REQUEST;
+    *((u32 *)(data + 5)) = TO_BIG_ENDIAN(piece_index);
+    *((u32 *)(data + 9)) = byte_offset; //TO_BIG_ENDIAN(0);
+    *((u32 *)(data + 13)) = TO_BIG_ENDIAN(piece_length);
 
     send_data(client, data, sizeof(data));
 }
@@ -989,6 +1016,10 @@ int main(int argc, char **argv)
 
     send_unchoke(&client);
     send_interested(&client);
+
+    // TODO: do the logic to get the piece_id from setted bitfields
+    // int piece_index = 0;
+    // download_piece(&client, piece_id, (u32)torrent.piece_length);
     
     tcp_client_cleanup(&client);
 
