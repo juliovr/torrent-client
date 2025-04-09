@@ -21,6 +21,11 @@ typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
 
+
+#define TO_BIG_ENDIAN(value)    ((((value) << 24) & 0xFF000000) | (((value) << 8) & 0xFF0000) | (((value) >> 8) & 0xFF00) | (((value) >> 24) & 0xFF))
+#define FROM_BIG_ENDIAN(value)  TO_BIG_ENDIAN(value) /* It's the same as converting to big endian, i.e. flip the bytes */
+
+
 #define MAX_URL_LENGTH 2048
 
 typedef int bool;
@@ -646,6 +651,7 @@ void tcp_client_cleanup(TCPClient *client)
  * handshake: <pstrlen><pstr><reserved><info_hash><peer_id> 
  */
 typedef struct HandshakeData {
+    int size;
     u8 pstrlen;
     char *pstr;
     u8 info_hash[SHA_DIGEST_LENGTH];
@@ -685,6 +691,8 @@ int handshake_data_serialize(u8 *handshake_serialized, HandshakeData *handshake_
 
 int handshake_data_deserialize(HandshakeData *handshake, u8 *buf, int size)
 {
+    u8 *start = buf;
+
     if (size == 0) {
         fprintf(stderr, "ERROR: no data received\n");
         return 1;
@@ -708,6 +716,9 @@ int handshake_data_deserialize(HandshakeData *handshake, u8 *buf, int size)
     buf += sizeof(handshake->info_hash);
 
     strncpy(handshake->peer_id, buf, sizeof(handshake->peer_id));
+    buf += sizeof(handshake->peer_id);
+
+    handshake->size = buf - start;
 
     return 0;
 }
@@ -724,6 +735,91 @@ bool validate_handshake(HandshakeData *a, HandshakeData *b)
     return memcmp(a->info_hash, b->info_hash, sizeof(a->info_hash)) == 0;
 }
 
+typedef enum MessageID {
+    MESSAGE_ID_CHOKE            = 0,
+    MESSAGE_ID_UNCHOKE          = 1,
+    MESSAGE_ID_INTERESTED       = 2,
+    MESSAGE_ID_NOT_INTERESTED   = 3,
+    MESSAGE_ID_HAVE             = 4,
+    MESSAGE_ID_BITFIELD         = 5,
+    MESSAGE_ID_REQUEST          = 6,
+    MESSAGE_ID_PIECE            = 7,
+    MESSAGE_ID_CANCEL           = 8,
+} MessageID;
+
+typedef struct Message {
+    MessageID id;
+    u8 *payload;
+} Message;
+
+void parse_bitfield(u8 *buf, int size)
+{
+    printf("parse_bitfield\n");
+    if (size == 0) {
+        fprintf(stderr, "ERROR: size = 0\n");
+        return;
+    }
+
+    int length = FROM_BIG_ENDIAN(*(int *)buf);
+    buf += 4;
+
+    int total_length = length + 4;
+
+    if (size < total_length) {
+        fprintf(stderr, "ERROR: buffer size %d is less than the total length of the message %d\n", size, total_length);
+        return;
+    }
+    
+    int id = *buf++;
+    if (id != MESSAGE_ID_BITFIELD) {
+        fprintf(stderr, "ERROR: id mismatch. Expected = %d, but got = %d\n", MESSAGE_ID_BITFIELD, id);
+        return;
+    }
+    
+    int bitfield_length = length - 1; // Minus the ID
+
+
+    
+    // TODO: take this into consideration??
+    // A bitfield of the wrong length is considered an error. 
+    // Clients should drop the connection if they receive bitfields that are not of the correct size, 
+    // or if the bitfield has any of the spare bits set.
+
+
+    
+
+    // Make the connection to get the bitfield data, but it is already in the buffer while making the handshake, 
+    // so just gather it from there.
+
+    // FD_ZERO(&client->ready_set);
+
+    // CURL *curl = client->curl;
+    // if (client->connected) {
+    //     CURLcode res;
+
+    //     FD_SET(client->sockfd, &client->ready_set);
+    //     while (1) {
+    //         select(client->sockfd + 1, &client->ready_set, NULL, NULL, NULL); // TODO: add timeout to avoid infinite loop
+    //         if (FD_ISSET(client->sockfd, &client->ready_set)) {
+    //             /* Receive response */
+    //             char buf[512];
+    //             size_t nread;
+    //             res = curl_easy_recv(curl, buf, sizeof(buf), &nread);
+    //             if (res != CURLE_OK) {
+    //                 fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+    //                 return;
+    //             }
+
+    //             printf("Data received = %ld\n", nread);
+                
+    //             break;
+    //         }
+    //     }
+    // }
+
+    // FD_CLR(client->sockfd, &client->ready_set);
+}
+
 void make_handshake(TCPClient *client, HandshakeData *handshake_data)
 {
     printf("Making handshake...\n");
@@ -731,7 +827,7 @@ void make_handshake(TCPClient *client, HandshakeData *handshake_data)
     FD_ZERO(&client->ready_set);
 
     CURL *curl = client->curl;
-    if (curl && client->connected) {
+    if (client->connected) {
         CURLcode res;
 
         /* Send data */
@@ -755,6 +851,7 @@ void make_handshake(TCPClient *client, HandshakeData *handshake_data)
                 res = curl_easy_recv(curl, buf, sizeof(buf), &nread);
                 if (res != CURLE_OK) {
                     fprintf(stderr, "ERROR: getting handshake response\n");
+                    fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
                     return;
                 }
 
@@ -773,6 +870,11 @@ void make_handshake(TCPClient *client, HandshakeData *handshake_data)
                 }
 
                 handshake_data_cleanup(&handshake_response);
+
+
+                u8 *bitfield_data = (buf + handshake_response.size);
+                parse_bitfield(bitfield_data, nread - handshake_response.size);
+
                 break;
             }
         }
@@ -782,22 +884,6 @@ void make_handshake(TCPClient *client, HandshakeData *handshake_data)
     }
 }
 
-typedef enum MessageID {
-    MESSAGE_ID_CHOKE            = 0,
-    MESSAGE_ID_UNCHOKE          = 1,
-    MESSAGE_ID_INTERESTED       = 2,
-    MESSAGE_ID_NOT_INTERESTED   = 3,
-    MESSAGE_ID_HAVE             = 4,
-    MESSAGE_ID_BITFIELD         = 5,
-    MESSAGE_ID_REQUEST          = 6,
-    MESSAGE_ID_PIECE            = 7,
-    MESSAGE_ID_CANCEL           = 8,
-} MessageID;
-
-typedef struct Message {
-    MessageID id;
-    u8 *payload;
-} Message;
 
 void parse_message(char *buf, int size)
 {
@@ -824,9 +910,57 @@ void parse_message(char *buf, int size)
     }
 }
 
+
+void send_data(TCPClient *client, u8 *data, int data_size)
+{
+    FD_ZERO(&client->ready_set);
+
+    CURL *curl = client->curl;
+    if (client->connected) {
+        CURLcode res;
+        
+        FD_SET(client->sockfd, &client->ready_set);
+        while (1) {
+            select(client->sockfd + 1, NULL, &client->ready_set, NULL, NULL);
+            if (FD_ISSET(client->sockfd, &client->ready_set)) {
+                size_t sent;
+                res = curl_easy_send(curl, data, data_size, &sent);
+                printf("Sent = %ld\n", sent);
+
+                if (res != CURLE_OK) {
+                    fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+                }
+
+                break;
+            }
+        }
+    }
+
+    FD_CLR(client->sockfd, &client->ready_set);
+}
+
 void send_unchoke(TCPClient *client)
 {
+    printf("sending unchoke\n");
+    int length = 1;
     
+    u8 data[5];
+    *((u32 *)data) = TO_BIG_ENDIAN(length);
+    data[4] = MESSAGE_ID_UNCHOKE;
+    
+    send_data(client, data, sizeof(data));
+}
+
+void send_interested(TCPClient *client)
+{
+    printf("sending interested\n");
+    int length = 1;
+
+    u8 data[5];
+    *((u32 *)data) = TO_BIG_ENDIAN(length);
+    data[4] = MESSAGE_ID_INTERESTED;
+
+    send_data(client, data, sizeof(data));
 }
 
 
@@ -852,15 +986,17 @@ int main(int argc, char **argv)
     HandshakeData handshake_data = create_handshake_data(torrent.info_hash, torrent.peer_id);
     Peer peer = peers_list.peers[0];
 
+    // TODO: create a thread for each peer and do the connection
     char url[21] = "130.44.171.228:61310"; // TODO: use peer's data
     // snprintf(url, MAX_URL_LENGTH, "%.*s:%d", ip.length, ip.chars, port);
     
     TCPClient client = new_tcp_client(url);
     tcp_client_connect(&client);
 
-    make_handshake(&client, &handshake_data); // TODO: create a thread for each peer and do the connection
+    make_handshake(&client, &handshake_data);
 
     send_unchoke(&client);
+    send_interested(&client);
     
     tcp_client_cleanup(&client);
 
