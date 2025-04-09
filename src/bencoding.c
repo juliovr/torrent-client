@@ -752,6 +752,7 @@ typedef enum MessageID {
 typedef struct Message {
     MessageID id;
     u8 *payload;
+    int payload_size;
 } Message;
 
 Message *parse_message(u8 *buf, int size)
@@ -773,13 +774,14 @@ Message *parse_message(u8 *buf, int size)
     
     int id = *buf++;
     
-    int payload_length = length - 1; // Minus the ID
-    u8 *payload = (u8 *)malloc(payload_length);
-    memcpy(payload, buf, payload_length);
+    int payload_size = length - 1; // Minus the ID
+    u8 *payload = (u8 *)malloc(payload_size);
+    memcpy(payload, buf, payload_size);
 
     Message *message = (Message *)malloc(sizeof(Message));
     message->id = id;
     message->payload = payload;
+    message->payload_size = payload_size;
 
     return message;
     
@@ -984,7 +986,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "Got no bitfield from handshake\n");
         exit(1);
     }
-    
+
     send_unchoke(&client);
     send_interested(&client);
     
