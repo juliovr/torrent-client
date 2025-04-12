@@ -970,7 +970,7 @@ Message *receive_message(TCPClient *client)
 
 
 /*
-Extracted from https://curl.se/libcurl/c/sendrecv.html, but it didn't work as I expected (get the full response in 1 shot).
+Extracted and adapted from https://curl.se/libcurl/c/sendrecv.html, but it didn't work as I expected (get the full response in 1 shot).
 Using my implementations for now, let's see how it goes.
 */
 // static int wait_on_socket(TCPClient *client, int for_recv, long timeout_ms)
@@ -1188,7 +1188,7 @@ void download_piece(TCPClient *client, int piece_index, u32 piece_length)
             *((u32 *)data) = TO_BIG_ENDIAN(length);
             data[4] = MESSAGE_ID_REQUEST;
             *((u32 *)(data + 5)) = TO_BIG_ENDIAN(piece_index);
-            *((u32 *)(data + 9)) = byte_offset; //TO_BIG_ENDIAN(0);
+            *((u32 *)(data + 9)) = TO_BIG_ENDIAN(byte_offset);
             *((u32 *)(data + 13)) = TO_BIG_ENDIAN(piece_request_size);
         
             printf("request payload:");
@@ -1202,15 +1202,6 @@ void download_piece(TCPClient *client, int piece_index, u32 piece_length)
         }
 
 
-        // char buf[MAX_REQUEST_SIZE];
-        // size_t nread;
-        // res = receive_data(client, buf, sizeof(buf), &nread);
-        // if (res != CURLE_OK) {
-        //     fprintf(stderr, "ERROR: could not receive request response\n");
-        //     return;
-        // }
-
-        // Message *message = buffer_to_message(buf, nread);
         Message *message = receive_message(client);
         if (message == NULL) {
             printf("Message NULL, treating as keep-alive\n");
@@ -1253,40 +1244,7 @@ void download_piece(TCPClient *client, int piece_index, u32 piece_length)
                 } break;
             }
         }
-
-        // printf("piece data:");
-        // PRINT_HEX(buf, nread);
     }
-    
-
-
-    // u8 data[17];
-    // *((u32 *)data) = TO_BIG_ENDIAN(length);
-    // data[4] = MESSAGE_ID_REQUEST;
-    // *((u32 *)(data + 5)) = TO_BIG_ENDIAN(piece_index);
-    // *((u32 *)(data + 9)) = byte_offset; //TO_BIG_ENDIAN(0);
-    // *((u32 *)(data + 13)) = TO_BIG_ENDIAN(piece_request_size);
-
-    // PRINT_HEX(data, sizeof(data));
-
-    // res = send_data(client, data, sizeof(data));
-    // if (res != CURLE_OK) {
-    //     fprintf(stderr, "ERROR: could not send request\n");
-    //     return;
-    // }
-
-
-    // char buf[16384];
-    // size_t nread;
-    // res = receive_data(client, buf, sizeof(buf), &nread);
-    // if (res != CURLE_OK) {
-    //     fprintf(stderr, "ERROR: could not receive request response\n");
-    //     return;
-    // }
-
-    // printf("piece data:");
-    // PRINT_HEX(buf, nread);
-    
 }
 
 
