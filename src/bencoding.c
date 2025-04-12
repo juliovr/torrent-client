@@ -39,6 +39,9 @@ do {                                    \
 #define MAX_URL_LENGTH      2048
 #define MAX_REQUEST_SIZE    KILOBYTE(16)
 #define MIN(a, b)           (((a) < (b)) ? (a) : (b))
+#define MAX(a, b)           (((a) > (b)) ? (a) : (b))
+#define TIMEOUT_MS          (10000L)
+
 
 typedef int bool;
 #define true 1
@@ -609,6 +612,7 @@ TCPClient new_tcp_client(char *url)
     TCPClient client = {
         .url = url,
         .connected = false,
+        .choked = true,
     };
 
     return client;
@@ -750,6 +754,105 @@ bool validate_handshake(HandshakeData *a, HandshakeData *b)
     return memcmp(a->info_hash, b->info_hash, sizeof(a->info_hash)) == 0;
 }
 
+
+CURLcode send_data(TCPClient *client, u8 *data, int data_size)
+{
+    printf("Sending data...\n");
+
+    long timeout_ms = TIMEOUT_MS;
+
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (int)(timeout_ms % 1000) * 1000;
+
+    CURLcode res;
+
+    FD_ZERO(&client->ready_set);
+
+    CURL *curl = client->curl;
+    if (client->connected) {
+        FD_SET(client->sockfd, &client->ready_set);
+        while (1) {
+            int select_result = select(client->sockfd + 1, NULL, &client->ready_set, NULL, &tv);
+            if (select_result == 0) {
+                fprintf(stderr, "ERROR: timeout\n");
+                return 1;
+            }
+            if (select_result < 0) {
+                fprintf(stderr, "ERROR: select()\n");
+                return 2;
+            }
+
+            if (FD_ISSET(client->sockfd, &client->ready_set)) {
+                size_t nsent_total = 0;
+                do {
+                    size_t nsent = 0;
+                    res = curl_easy_send(curl, data + nsent_total, data_size - nsent_total, &nsent);
+                    if (res == CURLE_OK) {
+                        nsent_total += nsent;
+                        printf("Sent = %ld bytes\n", nsent);
+                    } else {
+                        fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+                    }
+                } while (nsent_total < data_size || res == CURLE_AGAIN);
+
+                break;
+            }
+        }
+    }
+
+    FD_CLR(client->sockfd, &client->ready_set);
+
+    return res;
+}
+
+CURLcode receive_data(TCPClient *client, char *buf, int buf_size, size_t *nread_total)
+{
+    printf("Receiving data...\n");
+
+    long timeout_ms = TIMEOUT_MS;
+
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (int)(timeout_ms % 1000) * 1000;
+
+
+    CURLcode res;
+
+    FD_ZERO(&client->ready_set);
+
+    CURL *curl = client->curl;
+    if (client->connected) {
+        FD_SET(client->sockfd, &client->ready_set);
+        while (1) {
+            int select_result = select(client->sockfd + 1, &client->ready_set, NULL, NULL, &tv);
+            if (select_result == 0) {
+                fprintf(stderr, "ERROR: timeout\n");
+                return 1;
+            }
+            if (select_result < 0) {
+                fprintf(stderr, "ERROR: select()\n");
+                return 2;
+            }
+
+            if (FD_ISSET(client->sockfd, &client->ready_set)) {
+                res = curl_easy_recv(curl, buf, buf_size, nread_total);
+                if (res != CURLE_OK) {
+                    fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+                }
+
+                printf("Received = %ld\n", *nread_total);
+
+                break;
+            }
+        }
+    }
+
+    FD_CLR(client->sockfd, &client->ready_set);
+
+    return res;
+}
+
 typedef enum MessageID {
     MESSAGE_ID_CHOKE            = 0,
     MESSAGE_ID_UNCHOKE          = 1,
@@ -768,28 +871,31 @@ typedef struct Message {
     int payload_size;
 } Message;
 
-Message *parse_to_message(u8 *buf, int size)
+Message *buffer_to_message(u8 *buf, int data_size)
 {
-    if (size == 0) {
-        fprintf(stderr, "ERROR: size = 0\n");
+    if (data_size == 0) {
         return NULL;
     }
 
     int length = FROM_BIG_ENDIAN(*(int *)buf);
     buf += 4;
 
-    int total_length = length + 4;
-
-    if (size < total_length) {
-        fprintf(stderr, "ERROR: buffer size %d is less than the total length of the message %d\n", size, total_length);
-        return NULL;
-    }
-    
     int id = *buf++;
     
-    int payload_size = length - 1; // Minus the ID
+    int payload_size = length - 1; // Minus the 1-byte ID.
+    if (payload_size < 0) {
+        fprintf(stderr, "ERROR: payload_size negative\n");
+        return NULL;
+    }
+
+
     u8 *payload = (u8 *)malloc(payload_size);
-    memcpy(payload, buf, payload_size);
+    int ncopied = 0;
+    
+    do {
+        memcpy(payload + ncopied, buf + ncopied, payload_size);
+    } while (data_size < payload_size); // Keep reading incoming data.
+
 
     Message *message = (Message *)malloc(sizeof(Message));
     message->id = id;
@@ -802,100 +908,158 @@ Message *parse_to_message(u8 *buf, int size)
     // A bitfield of the wrong length is considered an error. 
     // Clients should drop the connection if they receive bitfields that are not of the correct size, 
     // or if the bitfield has any of the spare bits set.
-
-
-
-
-    // Make the connection to get the bitfield data, but it is already in the buffer while making the handshake, 
-    // so just gather it from there.
-
-    // FD_ZERO(&client->ready_set);
-
-    // CURL *curl = client->curl;
-    // if (client->connected) {
-    //     CURLcode res;
-
-    //     FD_SET(client->sockfd, &client->ready_set);
-    //     while (1) {
-    //         select(client->sockfd + 1, &client->ready_set, NULL, NULL, NULL); // TODO: add timeout to avoid infinite loop
-    //         if (FD_ISSET(client->sockfd, &client->ready_set)) {
-    //             /* Receive response */
-    //             char buf[512];
-    //             size_t nread;
-    //             res = curl_easy_recv(curl, buf, sizeof(buf), &nread);
-    //             if (res != CURLE_OK) {
-    //                 fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
-    //                 return;
-    //             }
-
-    //             printf("Data received = %ld\n", nread);
-                
-    //             break;
-    //         }
-    //     }
-    // }
-
-    // FD_CLR(client->sockfd, &client->ready_set);
 }
 
-CURLcode send_data(TCPClient *client, u8 *data, int data_size)
+Message *receive_message(TCPClient *client)
 {
     CURLcode res;
 
-    FD_ZERO(&client->ready_set);
-
-    CURL *curl = client->curl;
-    if (client->connected) {
-        FD_SET(client->sockfd, &client->ready_set);
-        while (1) {
-            select(client->sockfd + 1, NULL, &client->ready_set, NULL, NULL);
-            if (FD_ISSET(client->sockfd, &client->ready_set)) {
-                size_t sent;
-                res = curl_easy_send(curl, data, data_size, &sent);
-                printf("Sent = %ld\n", sent);
-
-                if (res != CURLE_OK) {
-                    fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
-                }
-
-                break;
-            }
-        }
+    char buf[MAX_REQUEST_SIZE];
+    size_t nread = 0;
+    res = receive_data(client, buf, sizeof(buf), &nread);
+    if (res != CURLE_OK) {
+        fprintf(stderr, "ERROR: could not receive request response\n");
+        return NULL;
     }
 
-    FD_CLR(client->sockfd, &client->ready_set);
 
-    return res;
-}
-
-CURLcode receive_data(TCPClient *client, char *buf, int buf_size, size_t *nread)
-{
-    CURLcode res;
-
-    FD_ZERO(&client->ready_set);
-
-    CURL *curl = client->curl;
-    if (client->connected) {
-        FD_SET(client->sockfd, &client->ready_set);
-        while (1) {
-            select(client->sockfd + 1, &client->ready_set, NULL, NULL, NULL);
-            if (FD_ISSET(client->sockfd, &client->ready_set)) {
-                res = curl_easy_recv(curl, buf, buf_size, nread);
-                if (res != CURLE_OK) {
-                    fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
-                }
-
-                printf("Received = %ld\n", *nread);
-
-                break;
-            }
-        }
+    if (nread == 0) {
+        fprintf(stderr, "ERROR: No data read\n");
+        return NULL;
     }
 
-    FD_CLR(client->sockfd, &client->ready_set);
+    int length = FROM_BIG_ENDIAN(*(int *)buf);
+    int id = buf[4];
+    
+    int payload_size = length - 1; // Minus the 1-byte ID.
+    if (payload_size < 0) {
+        fprintf(stderr, "ERROR: payload_size negative\n");
+        return NULL;
+    }
 
-    return res;
+
+    u8 *payload = (u8 *)malloc(payload_size);
+    int ncopied = 0;
+    
+    int nread_payload = nread - 5;
+    memcpy(payload + ncopied, ((u8 *)buf) + 5, nread_payload);
+    ncopied += nread_payload;
+
+    while (ncopied < payload_size) {
+        // Keep reading data if it's not full in the first call (given by length).
+
+        nread = 0;
+        res = receive_data(client, buf, sizeof(buf), &nread);
+        if (res != CURLE_OK) {
+            fprintf(stderr, "ERROR: could not receive request response\n");
+            return NULL;
+        }
+
+        memcpy(payload + ncopied, buf, nread);
+        ncopied += nread;
+    }
+
+
+    Message *message = (Message *)malloc(sizeof(Message));
+    message->id = id;
+    message->payload = payload;
+    message->payload_size = payload_size;
+
+    return message;
 }
+
+
+/*
+Extracted from https://curl.se/libcurl/c/sendrecv.html, but it didn't work as I expected (get the full response in 1 shot).
+Using my implementations for now, let's see how it goes.
+*/
+// static int wait_on_socket(TCPClient *client, int for_recv, long timeout_ms)
+// {
+//     struct timeval tv;
+//     tv.tv_sec = timeout_ms / 1000;
+//     tv.tv_usec = (int)(timeout_ms % 1000) * 1000;
+    
+//     FD_ZERO(&client->ready_set);
+//     FD_SET(client->sockfd, &client->ready_set);
+    
+//     int res;
+//     if (for_recv) {
+//         res = select(client->sockfd + 1, &client->ready_set, NULL, NULL, &tv);
+//     } else {
+//         res = select(client->sockfd + 1, NULL, &client->ready_set, NULL, &tv);
+//     }
+
+//     return res;
+// }
+
+// CURLcode send_data(TCPClient *client, u8 *data, int data_size)
+// {
+//     CURLcode res;
+//     size_t nsent_total = 0;
+
+//     do {
+//         /* Warning: This example program may loop indefinitely.
+//         * A production-quality program must define a timeout and exit this loop
+//         * as soon as the timeout has expired. */
+//         size_t nsent;
+//         do {
+//             nsent = 0;
+//             res = curl_easy_send(client->curl, data + nsent_total, data_size - nsent_total, &nsent);
+//             nsent_total += nsent;
+
+//             if (res == CURLE_AGAIN && !wait_on_socket(client, 0, 6000L)) {
+//                 printf("Error: timeout.\n");
+//                 return 1;
+//             }
+//         } while(res == CURLE_AGAIN);
+
+//         if (res != CURLE_OK) {
+//             printf("Error: %s\n", curl_easy_strerror(res));
+//             return 1;
+//         }
+
+//         printf("Sent %lu bytes.\n", (unsigned long)nsent);
+
+//     } while(nsent_total < data_size);
+
+//     return res;
+// }
+
+// CURLcode receive_data(TCPClient *client, char *buff, int buff_size, size_t *nread_total)
+// {
+//     CURLcode res;
+    
+//     for(;;) {
+//         /* Warning: This example program may loop indefinitely (see above). */
+//         char buf[1024];
+//         size_t nread;
+//         do {
+//             nread = 0;
+//             res = curl_easy_recv(client->curl, buf, sizeof(buf), &nread);
+
+//             if (res == CURLE_AGAIN && !wait_on_socket(client, 1, 6000L)) {
+//                 printf("Error: timeout.\n");
+//                 return 1;
+//             }
+//         } while (res == CURLE_AGAIN);
+
+//         if (res != CURLE_OK) {
+//             printf("Error: %s\n", curl_easy_strerror(res));
+//             break;
+//         }
+
+//         if (nread == 0) {
+//             /* end of the response */
+//             break;
+//         }
+
+//         printf("Received %lu bytes.\n", (unsigned long)nread);
+//     }
+
+//     printf("End\n");
+
+//     return res;
+// }
 
 Message *make_handshake(TCPClient *client, HandshakeData *handshake_data)
 {
@@ -934,7 +1098,7 @@ Message *make_handshake(TCPClient *client, HandshakeData *handshake_data)
 
     
     u8 *bitfield_data = (buf + handshake_response.size);
-    bitfield = parse_to_message(bitfield_data, nread - handshake_response.size);
+    bitfield = buffer_to_message(bitfield_data, nread - handshake_response.size);
     if (bitfield->id != MESSAGE_ID_BITFIELD) {
         fprintf(stderr, "ERROR: id mismatch. Expected = %d, but got = %d\n", MESSAGE_ID_BITFIELD, bitfield->id);
     }
@@ -979,19 +1143,47 @@ void send_interested(TCPClient *client)
     }
 }
 
+// typedef struct DownloadState {
+//     TCPClient *client;
+//     u32 piece_length;
+
+// } DownloadState;
+
+void send_have(TCPClient *client, int piece_index)
+{
+    printf("Sending have message\n");
+
+    int length = 5;
+
+    u8 data[9];
+    *((u32 *)data) = TO_BIG_ENDIAN(length);
+    data[4] = MESSAGE_ID_HAVE;
+    *((u32 *)(data + 5)) = TO_BIG_ENDIAN(piece_index);
+
+    CURLcode res = send_data(client, data, sizeof(data));
+    if (res != CURLE_OK) {
+        fprintf(stderr, "ERROR: could not send have\n");
+    }
+}
+
 void download_piece(TCPClient *client, int piece_index, u32 piece_length)
 {
+    printf("================================================\n");
     printf("Download piece\n");
 
     CURLcode res;
     int length = 13;
-    int byte_offset = 0;
-    int piece_request_size = MIN(MAX_REQUEST_SIZE, piece_length);
+    
+    int remaining = piece_length;
+    int downloaded = 0;
+    
+    while (remaining > 0) {
+        printf("--------------------\n");
+        printf("Remaining = %d\n", remaining);
+        int byte_offset = downloaded;
+        int piece_request_size = MIN(MAX_REQUEST_SIZE, piece_length);
 
-    // TODO: make the logic to get the length but keep track of the remaining size and do the while loop based on that.
-    int i = 2;
-    while (i > 0) {
-        if (!choked) {
+        if (!client->choked) {
             u8 data[17];
             *((u32 *)data) = TO_BIG_ENDIAN(length);
             data[4] = MESSAGE_ID_REQUEST;
@@ -999,9 +1191,9 @@ void download_piece(TCPClient *client, int piece_index, u32 piece_length)
             *((u32 *)(data + 9)) = byte_offset; //TO_BIG_ENDIAN(0);
             *((u32 *)(data + 13)) = TO_BIG_ENDIAN(piece_request_size);
         
+            printf("request payload:");
             PRINT_HEX(data, sizeof(data));
         
-            printf("Sending data\n");
             res = send_data(client, data, sizeof(data));
             if (res != CURLE_OK) {
                 fprintf(stderr, "ERROR: could not send request\n");
@@ -1010,39 +1202,60 @@ void download_piece(TCPClient *client, int piece_index, u32 piece_length)
         }
 
 
-        char buf[MAX_REQUEST_SIZE];
-        size_t nread;
-        printf("Receiving data\n");
-        res = receive_data(client, buf, sizeof(buf), &nread);
-        if (res != CURLE_OK) {
-            fprintf(stderr, "ERROR: could not receive request response\n");
-            return;
-        }
+        // char buf[MAX_REQUEST_SIZE];
+        // size_t nread;
+        // res = receive_data(client, buf, sizeof(buf), &nread);
+        // if (res != CURLE_OK) {
+        //     fprintf(stderr, "ERROR: could not receive request response\n");
+        //     return;
+        // }
 
-        Message *message = parse_to_message(buf, sizeof(buf));
-        switch (message->id) {
-            case MESSAGE_ID_CHOKE: {
-                client->choked = true;
-            } break;
-            case MESSAGE_ID_UNCHOKE: {
-                client->choked = false;
-            } break;
-            case MESSAGE_ID_PIECE: {
-                // TODO: validate the message header (index and begin should match with the requested parameters).
-                // TODO: store the download data into a buffer (in the correct position) and do the remaining requests 
-                // until the whole piece is downloaded.
-                // TODO: after all is downloaded, store in the file.
-            } break;
+        // Message *message = buffer_to_message(buf, nread);
+        Message *message = receive_message(client);
+        if (message == NULL) {
+            printf("Message NULL, treating as keep-alive\n");
+        } else {
+            printf("\nMessage received:\n");
+            printf("message_id = %d\n", message->id);
+            printf("payload_size = %d\n", message->payload_size);
+
+            switch (message->id) {
+                case MESSAGE_ID_CHOKE: {
+                    client->choked = true;
+                } break;
+                case MESSAGE_ID_UNCHOKE: {
+                    client->choked = false;
+                } break;
+                case MESSAGE_ID_PIECE: {
+                    int index = FROM_BIG_ENDIAN(*((int *)(message->payload + 0)));
+                    int begin = FROM_BIG_ENDIAN(*((int *)(message->payload + 4)));
+                    u8 *block = message->payload + 8;
+    
+                    if (piece_index != index) {
+                        fprintf(stderr, "ERROR: piece index does not match. Requested = %d, but got %d\n", piece_index, index);
+                        return;
+                    }
+    
+                    if (byte_offset != begin) {
+                        fprintf(stderr, "ERROR: offset does not match. Requested = %d, but got %d\n", byte_offset, begin);
+                        return;
+                    }
+    
+                    int block_size = message->payload_size - 8;
+                    remaining -= block_size;
+                    downloaded += block_size;
+
+                    send_have(client, piece_index);
+    
+                    // TODO: store the download data into a buffer (in the correct position) and do the remaining requests 
+                    // until the whole piece is downloaded.
+                    // TODO: after all is downloaded, store in the file.
+                } break;
+            }
         }
 
         // printf("piece data:");
         // PRINT_HEX(buf, nread);
-
-        if (buf[4] == MESSAGE_ID_UNCHOKE) {
-            choked = 0;
-        }
-
-        --i;
     }
     
 
@@ -1115,11 +1328,6 @@ int main(int argc, char **argv)
 
     send_unchoke(&client);
     send_interested(&client);
-
-    // printf("receiving data...\n");
-    // char buf[128];
-    // size_t nread;
-    // receive_data(&client, buf, sizeof(buf), &nread);
 
     // TODO: do the logic to get the piece_id from setted bitfields
     int piece_index = 0;
