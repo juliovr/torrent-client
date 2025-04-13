@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
 
 #include <unistd.h>
 
@@ -20,6 +21,9 @@ typedef int8_t  s8;
 typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
+
+typedef float f32;
+typedef double f64;
 
 
 #define TO_BIG_ENDIAN(value)    ((((value) << 24) & 0xFF000000) | (((value) << 8) & 0xFF0000) | (((value) >> 8) & 0xFF00) | (((value) >> 24) & 0xFF))
@@ -319,7 +323,7 @@ static bool byte_should_be_escaped(u8 c)
     }
 }
 
-static void bytes_to_string_escaped(u8 *hash, int hash_size, char *dest)
+static void bytes_to_string_escaped(char *dest, u8 *hash, int hash_size)
 {
     int dest_index = 0;
     for (int i = 0; i < hash_size; ++i) {
@@ -346,6 +350,8 @@ typedef struct Torrent {
     char info_hash_string[MAX_LENGTH_BYTES_ESCAPED(SHA_DIGEST_LENGTH)];
     u64 length;
     u64 piece_length;
+    int piece_count;
+    u8 *piece_hashes;
 } Torrent;
 
 
@@ -396,19 +402,26 @@ int parse_torrent(char *filename, Torrent *torrent)
         torrent->length = ((BencodeNumber *)get_by_key(info, "length"))->value;
         torrent->piece_length = ((BencodeNumber *)get_by_key(info, "piece length"))->value;
 
+        Bencode *piece_hashes = get_by_key(info, "pieces");
+
+        torrent->piece_count = ceil((f32)torrent->length / (f32)torrent->piece_length);
+        torrent->piece_hashes = (u8 *)malloc(torrent->piece_count * SHA_DIGEST_LENGTH);
+
+        memcpy(torrent->piece_hashes, ((BencodeString *)piece_hashes)->str.chars, piece_hashes->bencode_size);
+
         // Setting peer_id
-        // char peer_id_bytes[SHA_DIGEST_LENGTH];
         if (RAND_bytes(torrent->peer_id, SHA_DIGEST_LENGTH) != 1) {
             fprintf(stderr, "ERROR: creating peer id.\n");
             exit(1);
         }
 
-        bytes_to_string_escaped(torrent->peer_id, sizeof(torrent->peer_id), torrent->peer_id_string);
+        bytes_to_string_escaped(torrent->peer_id_string, torrent->peer_id, sizeof(torrent->peer_id));
 
 
         // Setting info_hash
         SHA1(info->bencode.bencode_chars, info->bencode.bencode_size, torrent->info_hash);
-        bytes_to_string_escaped(torrent->info_hash, sizeof(torrent->info_hash), torrent->info_hash_string);
+        bytes_to_string_escaped(torrent->info_hash_string, torrent->info_hash, sizeof(torrent->info_hash));
+
 
         code = 0;
     }
@@ -941,9 +954,9 @@ Message *receive_message(TCPClient *client)
     u8 *payload = (u8 *)malloc(payload_size);
     int ncopied = 0;
     
-    int nread_payload = nread - 5;
-    memcpy(payload + ncopied, ((u8 *)buf) + 5, nread_payload);
-    ncopied += nread_payload;
+    nread -= 5; // Length and ID.
+    memcpy(payload, ((u8 *)buf) + 5, nread);
+    ncopied += nread;
 
     while (ncopied < payload_size) {
         // Keep reading data if it's not full in the first call (given by length).
@@ -1166,22 +1179,24 @@ void send_have(TCPClient *client, int piece_index)
     }
 }
 
-void download_piece(TCPClient *client, int piece_index, u32 piece_length)
+void download_piece(TCPClient *client, Torrent *torrent, int piece_index)
 {
     printf("================================================\n");
-    printf("Download piece\n");
+    printf("Download piece %d\n", piece_index);
 
     CURLcode res;
     int length = 13;
     
-    int remaining = piece_length;
+    int remaining = torrent->piece_length;
     int downloaded = 0;
+
+    u8 piece_buf[torrent->piece_length];
     
     while (remaining > 0) {
         printf("--------------------\n");
         printf("Remaining = %d\n", remaining);
         int byte_offset = downloaded;
-        int piece_request_size = MIN(MAX_REQUEST_SIZE, piece_length);
+        int piece_request_size = MIN(MAX_REQUEST_SIZE, torrent->piece_length);
 
         if (!client->choked) {
             u8 data[17];
@@ -1221,6 +1236,9 @@ void download_piece(TCPClient *client, int piece_index, u32 piece_length)
                     int index = FROM_BIG_ENDIAN(*((int *)(message->payload + 0)));
                     int begin = FROM_BIG_ENDIAN(*((int *)(message->payload + 4)));
                     u8 *block = message->payload + 8;
+                    int block_size = message->payload_size - 8;
+                    printf("index = %d\n", index);
+                    printf("begin = %d\n", begin);
     
                     if (piece_index != index) {
                         fprintf(stderr, "ERROR: piece index does not match. Requested = %d, but got %d\n", piece_index, index);
@@ -1232,19 +1250,29 @@ void download_piece(TCPClient *client, int piece_index, u32 piece_length)
                         return;
                     }
     
-                    int block_size = message->payload_size - 8;
                     remaining -= block_size;
                     downloaded += block_size;
 
-                    send_have(client, piece_index);
-    
-                    // TODO: store the download data into a buffer (in the correct position) and do the remaining requests 
-                    // until the whole piece is downloaded.
-                    // TODO: after all is downloaded, store in the file.
+                    memcpy(piece_buf + begin, block, block_size);
                 } break;
             }
         }
     }
+
+    u8 expected_hash[SHA_DIGEST_LENGTH];
+    memcpy(expected_hash, torrent->piece_hashes + (piece_index * SHA_DIGEST_LENGTH), SHA_DIGEST_LENGTH);
+
+    u8 hash_piece[SHA_DIGEST_LENGTH];
+    SHA1(piece_buf, sizeof(piece_buf), hash_piece);
+
+    if (memcmp(expected_hash, hash_piece, SHA_DIGEST_LENGTH) != 0) {
+        fprintf(stderr, "ERROR: piece hash does not match the expected hash from torrent\n");
+        return;
+    }
+
+    send_have(client, piece_index);
+
+    // TODO: after all is downloaded, store in the file.
 }
 
 
@@ -1288,8 +1316,10 @@ int main(int argc, char **argv)
     send_interested(&client);
 
     // TODO: do the logic to get the piece_id from setted bitfields
+    // for (int piece_index = 0; piece_index < torrent.piece_count; ++piece_index) {
     int piece_index = 0;
-    download_piece(&client, piece_index, (u32)torrent.piece_length);
+        download_piece(&client, &torrent, piece_index);
+    // }
     
     tcp_client_cleanup(&client);
 
