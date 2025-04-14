@@ -4,6 +4,7 @@
 #include <string.h>
 #include <assert.h>
 #include <math.h>
+#include <pthread.h>
 
 #include <unistd.h>
 
@@ -45,6 +46,16 @@ do {                                    \
 #define MIN(a, b)           (((a) < (b)) ? (a) : (b))
 #define MAX(a, b)           (((a) > (b)) ? (a) : (b))
 #define TIMEOUT_MS          (10000L)
+
+#ifdef _DEBUG_PRINT
+    #ifdef _LINUX
+        #define DEBUG_PRINT(format, ...) printf(format, ##__VA_ARGS__)
+    #else
+        #define DEBUG_PRINT(format, ...) printf(format, __VA_ARGS__)
+    #endif
+#else
+#define DEBUG_PRINT(...)
+#endif
 
 
 typedef int bool;
@@ -620,6 +631,8 @@ typedef struct TCPClient {
     int sockfd;
     fd_set ready_set;
     bool choked;
+    u8 *bitfield;
+    int bitfield_size;
 } TCPClient;
 
 TCPClient new_tcp_client(char *url)
@@ -905,12 +918,8 @@ Message *buffer_to_message(u8 *buf, int data_size)
 
 
     u8 *payload = (u8 *)malloc(payload_size);
-    int ncopied = 0;
+    memcpy(payload, buf, payload_size);
     
-    do {
-        memcpy(payload + ncopied, buf + ncopied, payload_size);
-    } while (data_size < payload_size); // Keep reading incoming data.
-
 
     Message *message = (Message *)malloc(sizeof(Message));
     message->id = id;
@@ -983,103 +992,8 @@ Message *receive_message(TCPClient *client)
     return message;
 }
 
-
-/*
-Extracted and adapted from https://curl.se/libcurl/c/sendrecv.html, but it didn't work as I expected (get the full response in 1 shot).
-Using my implementations for now, let's see how it goes.
-*/
-// static int wait_on_socket(TCPClient *client, int for_recv, long timeout_ms)
-// {
-//     struct timeval tv;
-//     tv.tv_sec = timeout_ms / 1000;
-//     tv.tv_usec = (int)(timeout_ms % 1000) * 1000;
-    
-//     FD_ZERO(&client->ready_set);
-//     FD_SET(client->sockfd, &client->ready_set);
-    
-//     int res;
-//     if (for_recv) {
-//         res = select(client->sockfd + 1, &client->ready_set, NULL, NULL, &tv);
-//     } else {
-//         res = select(client->sockfd + 1, NULL, &client->ready_set, NULL, &tv);
-//     }
-
-//     return res;
-// }
-
-// CURLcode send_data(TCPClient *client, u8 *data, int data_size)
-// {
-//     CURLcode res;
-//     size_t nsent_total = 0;
-
-//     do {
-//         /* Warning: This example program may loop indefinitely.
-//         * A production-quality program must define a timeout and exit this loop
-//         * as soon as the timeout has expired. */
-//         size_t nsent;
-//         do {
-//             nsent = 0;
-//             res = curl_easy_send(client->curl, data + nsent_total, data_size - nsent_total, &nsent);
-//             nsent_total += nsent;
-
-//             if (res == CURLE_AGAIN && !wait_on_socket(client, 0, 6000L)) {
-//                 printf("Error: timeout.\n");
-//                 return 1;
-//             }
-//         } while(res == CURLE_AGAIN);
-
-//         if (res != CURLE_OK) {
-//             printf("Error: %s\n", curl_easy_strerror(res));
-//             return 1;
-//         }
-
-//         printf("Sent %lu bytes.\n", (unsigned long)nsent);
-
-//     } while(nsent_total < data_size);
-
-//     return res;
-// }
-
-// CURLcode receive_data(TCPClient *client, char *buff, int buff_size, size_t *nread_total)
-// {
-//     CURLcode res;
-    
-//     for(;;) {
-//         /* Warning: This example program may loop indefinitely (see above). */
-//         char buf[1024];
-//         size_t nread;
-//         do {
-//             nread = 0;
-//             res = curl_easy_recv(client->curl, buf, sizeof(buf), &nread);
-
-//             if (res == CURLE_AGAIN && !wait_on_socket(client, 1, 6000L)) {
-//                 printf("Error: timeout.\n");
-//                 return 1;
-//             }
-//         } while (res == CURLE_AGAIN);
-
-//         if (res != CURLE_OK) {
-//             printf("Error: %s\n", curl_easy_strerror(res));
-//             break;
-//         }
-
-//         if (nread == 0) {
-//             /* end of the response */
-//             break;
-//         }
-
-//         printf("Received %lu bytes.\n", (unsigned long)nread);
-//     }
-
-//     printf("End\n");
-
-//     return res;
-// }
-
 Message *make_handshake(TCPClient *client, HandshakeData *handshake_data)
 {
-    Message *bitfield = NULL;
-
     printf("Making handshake...\n");
     
     CURLcode res;
@@ -1089,33 +1003,35 @@ Message *make_handshake(TCPClient *client, HandshakeData *handshake_data)
     int handshake_serialized_size = handshake_data_serialize(handshake_serialized, handshake_data);
     res = send_data(client, handshake_serialized, handshake_serialized_size);
     if (res != CURLE_OK) {
-        return bitfield;
+        return NULL;
     }
 
     char buf[512];
     size_t nread;
     res = receive_data(client, buf, sizeof(buf), &nread);
     if (res != CURLE_OK) {
-        return bitfield;
+        return NULL;
     }
 
     HandshakeData handshake_response;
     if (handshake_data_deserialize(&handshake_response, buf, nread)) {
         fprintf(stderr, "ERROR: parsing response\n");
-        return bitfield;
+        return NULL;
     }
 
     if (validate_handshake(handshake_data, &handshake_response)) {
         printf("Handshake OK\n");
     } else {
         fprintf(stderr, "ERROR: handshake validation failed\n");
+        return NULL;
     }
 
     
     u8 *bitfield_data = (buf + handshake_response.size);
-    bitfield = buffer_to_message(bitfield_data, nread - handshake_response.size);
+    Message *bitfield = buffer_to_message(bitfield_data, nread - handshake_response.size);
     if (bitfield->id != MESSAGE_ID_BITFIELD) {
         fprintf(stderr, "ERROR: id mismatch. Expected = %d, but got = %d\n", MESSAGE_ID_BITFIELD, bitfield->id);
+        return NULL;
     }
 
     handshake_data_cleanup(&handshake_response);
@@ -1181,24 +1097,39 @@ void send_have(TCPClient *client, int piece_index)
     }
 }
 
+int get_piece_length(Torrent *torrent, int piece_index)
+{
+    int begin = piece_index * torrent->piece_length;
+    int end = begin + torrent->piece_length;;
+
+    if (piece_index == torrent->piece_count - 1) {
+        end = torrent->length;
+    }
+
+    return end - begin;
+}
+
 void download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_index)
 {
-    printf("================================================\n");
-    printf("Download piece %d\n", piece_index);
+    // printf("================================================\n");
+    // printf("Download piece %d\n", piece_index);
 
     CURLcode res;
     int length = 13;
+
+    int piece_length = get_piece_length(torrent, piece_index);
     
-    int remaining = torrent->piece_length;
+    int remaining = piece_length;
     int downloaded = 0;
 
-    u8 piece_buf[torrent->piece_length];
+    u8 piece_buf[piece_length];
     
     while (remaining > 0) {
-        printf("--------------------\n");
-        printf("Remaining = %d\n", remaining);
+        // printf("--------------------\n");
+        // printf("Remaining = %d\n", remaining);
         int byte_offset = downloaded;
-        int piece_request_size = MIN(MAX_REQUEST_SIZE, torrent->piece_length);
+        // int piece_request_size = MIN(MAX_REQUEST_SIZE, piece_length);
+        int piece_request_size = MAX_REQUEST_SIZE;
 
         if (!client->choked) {
             u8 data[17];
@@ -1208,8 +1139,8 @@ void download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_i
             *((u32 *)(data + 9)) = TO_BIG_ENDIAN(byte_offset);
             *((u32 *)(data + 13)) = TO_BIG_ENDIAN(piece_request_size);
         
-            printf("request payload:");
-            PRINT_HEX(data, sizeof(data));
+            // printf("request payload:");
+            // PRINT_HEX(data, sizeof(data));
         
             res = send_data(client, data, sizeof(data));
             if (res != CURLE_OK) {
@@ -1219,13 +1150,11 @@ void download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_i
         }
 
 
-        Message *message = receive_message(client);
-        if (message == NULL) {
-            printf("Message NULL, treating as keep-alive\n");
-        } else {
-            printf("\nMessage received:\n");
-            printf("message_id = %d\n", message->id);
-            printf("payload_size = %d\n", message->payload_size);
+        Message *message = receive_message(client); // Message NULL treated as keep-alive.
+        if (message != NULL) {
+            // printf("\nMessage received:\n");
+            // printf("message_id = %d\n", message->id);
+            // printf("payload_size = %d\n", message->payload_size);
 
             switch (message->id) {
                 case MESSAGE_ID_CHOKE: {
@@ -1239,8 +1168,8 @@ void download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_i
                     int begin = FROM_BIG_ENDIAN(*((int *)(message->payload + 4)));
                     u8 *block = message->payload + 8;
                     int block_size = message->payload_size - 8;
-                    printf("index = %d\n", index);
-                    printf("begin = %d\n", begin);
+                    // printf("index = %d\n", index);
+                    // printf("begin = %d\n", begin);
     
                     if (piece_index != index) {
                         fprintf(stderr, "ERROR: piece index does not match. Requested = %d, but got %d\n", piece_index, index);
@@ -1274,11 +1203,96 @@ void download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_i
 
     send_have(client, piece_index);
 
-    // TODO: after all is downloaded, store in the file.
     fseek(file, piece_index * torrent->piece_length, SEEK_SET);
     fwrite(piece_buf, 1, downloaded, file);
 }
 
+
+typedef struct QueueNode {
+    int data;
+    struct QueueNode *next;
+} QueueNode;
+
+typedef struct WorkQueue {
+    QueueNode *first;
+    QueueNode *last;
+    int count;
+    pthread_mutex_t mutex;
+} WorkQueue;
+
+void init_work_queue(WorkQueue *queue)
+{
+    queue->count = 0;
+    
+    if (pthread_mutex_init(&queue->mutex, NULL)) {
+        fprintf(stderr, "ERROR: Could not initialize mutex\n");
+        exit(1);
+    }
+}
+
+void enqueue(WorkQueue *queue, int piece_index)
+{
+    if (pthread_mutex_lock(&queue->mutex)) {
+        fprintf(stderr, "ERROR: Could not acquire the mutex\n");
+        exit(1);
+    }
+
+    QueueNode *old_last = queue->last;
+    queue->last = (QueueNode *)malloc(sizeof(QueueNode));
+    queue->last->data = piece_index;
+    
+    if (queue->count == 0) {
+        queue->first = queue->last;
+    } else {
+        old_last->next = queue->last;
+    }
+    
+    queue->count++;
+    
+    if (pthread_mutex_unlock(&queue->mutex)) {
+        fprintf(stderr, "ERROR: Could not release the mutex\n");
+        exit(1);
+    }
+}
+
+int dequeue(WorkQueue *queue, int *value) {
+    if (pthread_mutex_lock(&queue->mutex)) {
+        fprintf(stderr, "ERROR: Could not acquire the mutex\n");
+        exit(1);
+    }
+
+    if (queue->count == 0) {
+        return 0;
+    }
+
+    *value = queue->first->data;
+    QueueNode *old_first = queue->first;
+    queue->first = queue->first->next;
+    
+    free(old_first);
+
+    queue->count--;
+
+    if (pthread_mutex_unlock(&queue->mutex)) {
+        fprintf(stderr, "ERROR: Could not release the mutex\n");
+        exit(1);
+    }
+
+    return 1;
+}
+
+void cleanup_work_queue(WorkQueue *queue)
+{
+    // TODO: free in place instead of dequeueing the elements (overhead of reassigning pointers and mutex's locking).
+    while (queue->count > 0) {
+        int value;
+        dequeue(queue, &value);
+    }
+
+    if (pthread_mutex_destroy(&queue->mutex)) {
+        fprintf(stderr, "ERROR: Could not destroy mutex\n");
+    }
+}
 
 int main(int argc, char **argv)
 {
@@ -1319,12 +1333,32 @@ int main(int argc, char **argv)
     TCPClient client = new_tcp_client(url);
     tcp_client_connect(&client);
 
-    Message *bitfield = make_handshake(&client, &handshake_data);
-    if (bitfield == NULL) {
-        fprintf(stderr, "Got no bitfield from handshake\n");
+    Message *bitfield_message = make_handshake(&client, &handshake_data);
+    if (bitfield_message == NULL) {
         exit(1);
     }
 
+    client.bitfield = bitfield_message->payload;
+    client.bitfield_size = bitfield_message->payload_size;
+
+    
+    WorkQueue queue;
+    init_work_queue(&queue);
+
+    for (int piece_index = 0; piece_index < torrent.piece_count; ++piece_index) {
+        enqueue(&queue, piece_index);
+    }
+
+    printf("queue count = %d\n", queue.count);
+    while (queue.count > 0) {
+        int value;
+        if (dequeue(&queue, &value)) {
+            printf("value = %d\n", value);
+        }
+    }
+    printf("queue count = %d\n", queue.count);
+
+#if 0
     send_unchoke(&client);
     send_interested(&client);
 
@@ -1333,10 +1367,11 @@ int main(int argc, char **argv)
     int piece_index = 0;
         download_piece(&client, &torrent, file, piece_index);
     // }
+#endif
+    tcp_client_cleanup(&client);
+
 
     fclose(file);
-    
-    tcp_client_cleanup(&client);
 
     return 0;
 }
