@@ -348,6 +348,7 @@ typedef struct Torrent {
     char peer_id_string[MAX_LENGTH_BYTES_ESCAPED(SHA_DIGEST_LENGTH)];
     u8 info_hash[SHA_DIGEST_LENGTH];
     char info_hash_string[MAX_LENGTH_BYTES_ESCAPED(SHA_DIGEST_LENGTH)];
+    string filename;
     u64 length;
     u64 piece_length;
     int piece_count;
@@ -399,6 +400,7 @@ int parse_torrent(char *filename, Torrent *torrent)
 
         torrent->announce = ((BencodeString *)get_by_key(dictionary, "announce"))->str;
         torrent->port = 6881;
+        torrent->filename = ((BencodeString *)get_by_key(info, "name"))->str;
         torrent->length = ((BencodeNumber *)get_by_key(info, "length"))->value;
         torrent->piece_length = ((BencodeNumber *)get_by_key(info, "piece length"))->value;
 
@@ -1179,7 +1181,7 @@ void send_have(TCPClient *client, int piece_index)
     }
 }
 
-void download_piece(TCPClient *client, Torrent *torrent, int piece_index)
+void download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_index)
 {
     printf("================================================\n");
     printf("Download piece %d\n", piece_index);
@@ -1273,16 +1275,27 @@ void download_piece(TCPClient *client, Torrent *torrent, int piece_index)
     send_have(client, piece_index);
 
     // TODO: after all is downloaded, store in the file.
+    fseek(file, piece_index * torrent->piece_length, SEEK_SET);
+    fwrite(piece_buf, 1, downloaded, file);
 }
 
 
 int main(int argc, char **argv)
 {
-    // char *filename = "test_data/kubuntu-24.04.2-desktop-amd64.iso.torrent";
-    char *filename = "test_data/debian-12.10.0-amd64-netinst.iso.torrent";
+    // char *torrent_filename = "test_data/kubuntu-24.04.2-desktop-amd64.iso.torrent";
+    char *torrent_filename = "test_data/debian-12.10.0-amd64-netinst.iso.torrent";
     Torrent torrent;
-    if (parse_torrent(filename, &torrent)) {
+    if (parse_torrent(torrent_filename, &torrent)) {
         fprintf(stderr, "ERROR: parsing torrent\n");
+        exit(1);
+    }
+
+    char *filename = (char *)malloc(torrent.filename.length);
+    strncpy(filename, torrent.filename.chars, torrent.filename.length);
+
+    FILE *file = fopen(filename, "wb");
+    if (!file) {
+        fprintf(stderr, "ERROR: Could not create file %s\n", filename);
         exit(1);
     }
 
@@ -1318,8 +1331,10 @@ int main(int argc, char **argv)
     // TODO: do the logic to get the piece_id from setted bitfields
     // for (int piece_index = 0; piece_index < torrent.piece_count; ++piece_index) {
     int piece_index = 0;
-        download_piece(&client, &torrent, piece_index);
+        download_piece(&client, &torrent, file, piece_index);
     // }
+
+    fclose(file);
     
     tcp_client_cleanup(&client);
 
