@@ -1261,24 +1261,26 @@ int dequeue(WorkQueue *queue, int *value) {
         exit(1);
     }
 
-    if (queue->count == 0) {
-        return 0;
-    }
+    int result = 1;
 
-    *value = queue->first->data;
-    QueueNode *old_first = queue->first;
-    queue->first = queue->first->next;
+    if (queue->count != 0) {
+        *value = queue->first->data;
+        QueueNode *old_first = queue->first;
+        queue->first = queue->first->next;
+        
+        free(old_first);
     
-    free(old_first);
-
-    queue->count--;
+        queue->count--;
+        
+        result = 0;
+    }
 
     if (pthread_mutex_unlock(&queue->mutex)) {
         fprintf(stderr, "ERROR: Could not release the mutex\n");
         exit(1);
     }
 
-    return 1;
+    return result;
 }
 
 void cleanup_work_queue(WorkQueue *queue)
@@ -1294,8 +1296,62 @@ void cleanup_work_queue(WorkQueue *queue)
     }
 }
 
+typedef struct ThreadArgs {
+    FILE *file;
+    Torrent *torrent;
+    PeersList *peers_list;
+    WorkQueue *queue;
+} ThreadArgs;
+
+static void *
+attempt_download_thread(void *arg)
+{
+    ThreadArgs *args = (ThreadArgs *)arg;
+    FILE *file = args->file;
+    Torrent *torrent = args->torrent;
+    WorkQueue *queue = args->queue;
+    PeersList *peers_list = args->peers->list;
+
+
+    int piece_index;
+    if (dequeue(queue, &piece_index)) {
+        fprintf(stderr, "ERROR: Queue with no elements\n");
+        return;
+    }
+
+    // TODO: I need a peer to connect to, but I cannot know if that peer has the piece I'm looking for until the connection is done.
+    // Maybe just do the connection and if don't have the piece, close the connection and look for a new Peer.
+    Peer *peer = find_peer_has_piece(peers_list, piece_index);
+
+    HandshakeData handshake_data = create_handshake_data(torrent->info_hash, torrent->peer_id);
+    
+
+    // char url[21] = "89.115.213.213:56531"; // TODO: use peer's data
+    char url[MAX_URL_LENGTH];
+    snprintf(url, MAX_URL_LENGTH, "%.*s:%d", peer.ip.length, peer.ip.chars, peer.port);
+    
+    TCPClient client = new_tcp_client(url);
+    tcp_client_connect(&client);
+
+    Message *bitfield_message = make_handshake(&client, &handshake_data);
+    if (bitfield_message != NULL) {
+        client.bitfield = bitfield_message->payload;
+        client.bitfield_size = bitfield_message->payload_size;
+    
+        send_unchoke(&client);
+        send_interested(&client);
+        
+        download_piece(&client, torrent, file, piece_index);
+    }
+
+    tcp_client_cleanup(&client);
+}
+
 int main(int argc, char **argv)
 {
+    int ncores = (int)sysconf(_SC_NPROCESSORS_CONF);
+    printf("Using ncores: %d\n", ncores);
+
     // char *torrent_filename = "test_data/kubuntu-24.04.2-desktop-amd64.iso.torrent";
     char *torrent_filename = "test_data/debian-12.10.0-amd64-netinst.iso.torrent";
     Torrent torrent;
@@ -1313,35 +1369,9 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    printf("Piece length = %ld\n", torrent.piece_length);
+    // printf("Piece length = %ld\n", torrent.piece_length);
 
-    PeersList peers_list = get_peers(&torrent);
-    // printf("n_peers = %d\n", peers_list.n);
-    // for (int i = 0; i < peers_list.n; ++i) {
-    //     Peer peer = peers_list.peers[i];
-    //     printf("ip = %.*s:%d\n", peer.ip.length, peer.ip.chars, peer.port);
-    // }
 
-    HandshakeData handshake_data = create_handshake_data(torrent.info_hash, torrent.peer_id);
-    Peer peer = peers_list.peers[0];
-
-    // TODO: create a thread for each peer and do the connection
-    char url[21] = "191.19.6.244:6881"; // TODO: use peer's data
-    // char url[MAX_URL_LENGTH];
-    // snprintf(url, MAX_URL_LENGTH, "%.*s:%d", peer.ip.length, peer.ip.chars, peer.port);
-    
-    TCPClient client = new_tcp_client(url);
-    tcp_client_connect(&client);
-
-    Message *bitfield_message = make_handshake(&client, &handshake_data);
-    if (bitfield_message == NULL) {
-        exit(1);
-    }
-
-    client.bitfield = bitfield_message->payload;
-    client.bitfield_size = bitfield_message->payload_size;
-
-    
     WorkQueue queue;
     init_work_queue(&queue);
 
@@ -1349,27 +1379,37 @@ int main(int argc, char **argv)
         enqueue(&queue, piece_index);
     }
 
-    printf("queue count = %d\n", queue.count);
-    while (queue.count > 0) {
-        int value;
-        if (dequeue(&queue, &value)) {
-            printf("value = %d\n", value);
+
+    PeersList peers_list = get_peers(&torrent);
+    // printf("n_peers = %d\n", peers_list.n);
+    // for (int i = 0; i < peers_list.n; ++i) {
+    //     Peer peer = peers_list.peers[i];
+    //     printf("ip = %.*s:%d\n", peer.ip.length, peer.ip.chars, peer.port);
+    // }
+    
+
+    pthread_t *threads = (pthread_t *)malloc(ncores * sizeof(pthread_t));
+
+    for (int i = 0; i < ncores; ++i) {
+        ThreadArgs args = {
+            .file = file,
+            .torrent = &torrent,
+            .peers_list = &peers_list,
+            .queue = &queue,
+        };
+
+        int res = pthread_create((thread + i), NULL, attempt_download_thread, args);
+        if (res != 0) {
+            fprintf(stderr, "ERROR: Could not create thread %d\n", i);
         }
     }
-    printf("queue count = %d\n", queue.count);
 
-#if 0
-    send_unchoke(&client);
-    send_interested(&client);
-
-    // TODO: do the logic to get the piece_id from setted bitfields
-    // for (int piece_index = 0; piece_index < torrent.piece_count; ++piece_index) {
-    int piece_index = 0;
-        download_piece(&client, &torrent, file, piece_index);
-    // }
-#endif
-    tcp_client_cleanup(&client);
-
+    for (int i = 0; i < ncores; ++i) {
+        int res = pthread_join(threads[i], void **retval);
+        if (res != 0) {
+            fprintf(stderr, "ERROr: Could not join thread\n");
+        }
+    }
 
     fclose(file);
 
