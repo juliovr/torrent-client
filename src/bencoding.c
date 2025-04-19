@@ -904,8 +904,12 @@ typedef struct Message {
 
 void free_message(Message *message)
 {
-    if (message->payload) {
-        free(message->payload);
+    if (message) {
+        if (message->payload) {
+            free(message->payload);
+        }
+
+        free(message);
     }
 }
 
@@ -945,24 +949,26 @@ Message *buffer_to_message(u8 *buf, int data_size)
 
 Message *receive_message(TCPClient *client)
 {
+    Message *message = NULL;
+
     CURLcode res;
 
-    char buf[MAX_REQUEST_SIZE];
+    char *buf = malloc(MAX_REQUEST_SIZE);
     size_t nread = 0;
-    res = receive_data(client, buf, sizeof(buf), &nread);
+    res = receive_data(client, buf, MAX_REQUEST_SIZE, &nread);
     if (res != CURLE_OK) {
-        return NULL;
+        goto receive_message_cleanup;
     }
 
     if (nread < 5) {
         fprintf(stderr, "ERROR: nread %ld, not enough data for message length and ID\n", nread);
-        return NULL;
+        goto receive_message_cleanup;
     }
 
     int length = FROM_BIG_ENDIAN(*(int *)buf);
     int id = buf[4];
     
-    Message *message = (Message *)malloc(sizeof(Message));
+    message = (Message *)malloc(sizeof(Message));
     message->id = id;
     message->payload = NULL;
     message->payload_size = 0;
@@ -970,7 +976,7 @@ Message *receive_message(TCPClient *client)
     
     int payload_size = length - 1; // Minus the 1-byte ID.
     if (payload_size <= 0) {
-        return message;
+        goto receive_message_cleanup;
     }
 
     u8 *payload = (u8 *)malloc(payload_size);
@@ -978,7 +984,7 @@ Message *receive_message(TCPClient *client)
     
     nread -= 5; // Length and ID.
     if (nread <= 0) {
-        return message;
+        goto receive_message_cleanup;
     }
 
     int left = payload_size - ncopied;
@@ -991,9 +997,9 @@ Message *receive_message(TCPClient *client)
         // Keep reading data if it's not full in the first call (given by length).
 
         nread = 0;
-        res = receive_data(client, buf, sizeof(buf), &nread);
+        res = receive_data(client, buf, MAX_REQUEST_SIZE, &nread);
         if (res != CURLE_OK) {
-            return NULL;
+            goto receive_message_cleanup;
         }
 
         left = payload_size - ncopied;
@@ -1006,6 +1012,9 @@ Message *receive_message(TCPClient *client)
 
     message->payload = payload;
     message->payload_size = payload_size;
+
+receive_message_cleanup:
+    if (buf) free(buf);
 
     return message;
 }
@@ -1148,6 +1157,7 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
 
     // u8 piece_buf[piece_length];
     u8 *piece_buf = (u8 *)malloc(piece_length);
+    Message *message = NULL;
     
     while (remaining > 0) {
         // printf("--------------------\n");
@@ -1170,15 +1180,15 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
             res = send_data(client, data, sizeof(data));
             if (res != CURLE_OK) {
                 fprintf(stderr, "ERROR: (%d) could not send request\n", res);
-                return result;
+                goto download_piece_cleanup;
             }
         }
 
 
-        Message *message = receive_message(client);
+        message = receive_message(client);
         if (message == NULL) {
             // Keep-alive
-            return result;
+            goto download_piece_cleanup;
         }
         
         // printf("\nMessage received:\n");
@@ -1194,7 +1204,7 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
             } break;
             case MESSAGE_ID_PIECE: {
                 if (message->payload_size < 8) {
-                    return result;
+                    goto download_piece_cleanup;
                 }
 
                 int index = FROM_BIG_ENDIAN(*((int *)(message->payload + 0)));
@@ -1222,8 +1232,6 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
                 memcpy(piece_buf + begin, block, block_size);
             } break;
         }
-
-        free_message(message);
     }
 
     u8 expected_hash[SHA_DIGEST_LENGTH];
@@ -1241,11 +1249,14 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
 
     fseek(file, piece_index * torrent->piece_length, SEEK_SET);
     fwrite(piece_buf, 1, downloaded, file);
-    printf("Written into file.\n");
-
-    if (piece_buf) free(piece_buf);
+    printf("Written %d bytes into file.\n", downloaded);
 
     result = 0;
+    
+download_piece_cleanup:
+    free_message(message);
+    if (piece_buf) free(piece_buf);
+
     
     return result;
 }
@@ -1374,6 +1385,7 @@ attempt_download_thread(void *arg)
     PeersList *peers_list = args->peers_list;
     
     int peer_index = args->absolute_peer_index;
+
     do {
         Peer *peer = peers_list->peers + (peer_index % peers_list->n);
         
@@ -1392,19 +1404,21 @@ attempt_download_thread(void *arg)
                 send_unchoke(&client);
                 send_interested(&client);
                 
-                int piece_index;
-                while (dequeue(queue, &piece_index)) {
-                    int downloaded_err = 1;
-                    if (peer_has_piece(bitfield_message, piece_index)) {
-                        client.bitfield = bitfield_message->payload;
-                        client.bitfield_size = bitfield_message->payload_size;
+                for (int attempt = 0; attempt < 3; ++attempt) {
+                    int piece_index;
+                    while (dequeue(queue, &piece_index)) {
+                        int downloaded_err = 1;
+                        if (peer_has_piece(bitfield_message, piece_index)) {
+                            client.bitfield = bitfield_message->payload;
+                            client.bitfield_size = bitfield_message->payload_size;
+                            
+                            downloaded_err = download_piece(&client, torrent, file, piece_index);
+                        }
                         
-                        downloaded_err = download_piece(&client, torrent, file, piece_index);
-                    }
-                    
-                    if (downloaded_err) {
-                        enqueue(queue, piece_index);
-                        break;
+                        if (downloaded_err) {
+                            enqueue(queue, piece_index);
+                            break;
+                        }
                     }
                 }
             }
