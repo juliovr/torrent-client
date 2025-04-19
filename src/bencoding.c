@@ -589,7 +589,7 @@ PeersList get_peers(Torrent *torrent)
         Bencode *bencode_response = decode(&tokenizer);
         BencodeString *failure_reason = (BencodeString *)get_by_key((BencodeDictionary *)bencode_response, "failure reason");
         if (failure_reason != NULL) {
-            fprintf(stderr, "ERROR: %.*s\n", failure_reason->str.length, failure_reason->str.chars);
+            fprintf(stderr, "ERROR: failure_reason: %.*s\n", failure_reason->str.length, failure_reason->str.chars);
             exit(1);
         }
 
@@ -638,6 +638,7 @@ typedef struct TCPClient {
 TCPClient new_tcp_client(char *url)
 {
     TCPClient client = {
+        .curl = NULL,
         .url = url,
         .connected = false,
         .choked = true,
@@ -655,17 +656,17 @@ void tcp_client_connect(TCPClient *client)
     CURL *curl = curl_easy_init();
     if (curl) {
         curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, TIMEOUT_MS);
         curl_easy_setopt(curl, CURLOPT_URL, client->url);
         /* Do not do the transfer - only connect to host */
         curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
-    
+        
         CURLcode res;
        
         printf("Connecting to: %s\n", client->url);
         res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
-            fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+            fprintf(stderr, "ERROR: (%d) curl_easy_perform %s: %s\n", res, client->url, curl_easy_strerror(res));
             return;
         }
     
@@ -673,10 +674,10 @@ void tcp_client_connect(TCPClient *client)
         curl_socket_t sockfd;
         res = curl_easy_getinfo(curl, CURLINFO_ACTIVESOCKET, &sockfd);
         if (res != CURLE_OK) {
-            fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+            fprintf(stderr, "ERROR: (%d) curl_easy_getinfo %s\n", res, curl_easy_strerror(res));
             return;
         }
-        printf("sockfd = %d\n", sockfd);
+        // printf("sockfd = %d\n", sockfd);
 
         client->curl = curl;
         client->connected = true;
@@ -772,9 +773,9 @@ int handshake_data_deserialize(HandshakeData *handshake, u8 *buf, int size)
 
 void handshake_data_cleanup(HandshakeData *handshake_data)
 {
-    if (!handshake_data) return;
-
-    free(handshake_data->pstr);
+    if (handshake_data) {
+        free(handshake_data->pstr);
+    }
 }
 
 bool validate_handshake(HandshakeData *a, HandshakeData *b)
@@ -785,7 +786,7 @@ bool validate_handshake(HandshakeData *a, HandshakeData *b)
 
 CURLcode send_data(TCPClient *client, u8 *data, int data_size)
 {
-    printf("Sending data...\n");
+    // printf("Sending data...\n");
 
     long timeout_ms = TIMEOUT_MS;
 
@@ -816,12 +817,14 @@ CURLcode send_data(TCPClient *client, u8 *data, int data_size)
                 do {
                     size_t nsent = 0;
                     res = curl_easy_send(curl, data + nsent_total, data_size - nsent_total, &nsent);
-                    if (res == CURLE_OK) {
-                        nsent_total += nsent;
-                        printf("Sent = %ld bytes\n", nsent);
-                    } else {
-                        fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+                    if (res != CURLE_OK) {
+                        fprintf(stderr, "ERROR: (%d) curl_easy_send %s\n", res, curl_easy_strerror(res));
+                        return res;
                     }
+                    
+                    // printf("Sent = %ld bytes\n", nsent);
+                    nsent_total += nsent;
+
                 } while (nsent_total < data_size || res == CURLE_AGAIN);
 
                 break;
@@ -836,7 +839,7 @@ CURLcode send_data(TCPClient *client, u8 *data, int data_size)
 
 CURLcode receive_data(TCPClient *client, char *buf, int buf_size, size_t *nread_total)
 {
-    printf("Receiving data...\n");
+    // printf("Receiving data...\n");
 
     long timeout_ms = TIMEOUT_MS;
 
@@ -866,10 +869,10 @@ CURLcode receive_data(TCPClient *client, char *buf, int buf_size, size_t *nread_
             if (FD_ISSET(client->sockfd, &client->ready_set)) {
                 res = curl_easy_recv(curl, buf, buf_size, nread_total);
                 if (res != CURLE_OK) {
-                    fprintf(stderr, "ERROR: %s\n", curl_easy_strerror(res));
+                    fprintf(stderr, "ERROR: (%d) curl_easy_recv: %s\n", res, curl_easy_strerror(res));
                 }
 
-                printf("Received = %ld\n", *nread_total);
+                // printf("Received = %ld\n", *nread_total);
 
                 break;
             }
@@ -899,6 +902,13 @@ typedef struct Message {
     int payload_size;
 } Message;
 
+void free_message(Message *message)
+{
+    if (message->payload) {
+        free(message->payload);
+    }
+}
+
 Message *buffer_to_message(u8 *buf, int data_size)
 {
     if (data_size == 0) {
@@ -911,8 +921,7 @@ Message *buffer_to_message(u8 *buf, int data_size)
     int id = *buf++;
     
     int payload_size = length - 1; // Minus the 1-byte ID.
-    if (payload_size < 0) {
-        fprintf(stderr, "ERROR: payload_size negative\n");
+    if (payload_size <= 0) {
         return NULL;
     }
 
@@ -942,32 +951,41 @@ Message *receive_message(TCPClient *client)
     size_t nread = 0;
     res = receive_data(client, buf, sizeof(buf), &nread);
     if (res != CURLE_OK) {
-        fprintf(stderr, "ERROR: could not receive request response\n");
         return NULL;
     }
 
-
-    if (nread == 0) {
-        fprintf(stderr, "ERROR: No data read\n");
+    if (nread < 5) {
+        fprintf(stderr, "ERROR: nread %ld, not enough data for message length and ID\n", nread);
         return NULL;
     }
 
     int length = FROM_BIG_ENDIAN(*(int *)buf);
     int id = buf[4];
     
-    int payload_size = length - 1; // Minus the 1-byte ID.
-    if (payload_size < 0) {
-        fprintf(stderr, "ERROR: payload_size negative\n");
-        return NULL;
-    }
+    Message *message = (Message *)malloc(sizeof(Message));
+    message->id = id;
+    message->payload = NULL;
+    message->payload_size = 0;
 
+    
+    int payload_size = length - 1; // Minus the 1-byte ID.
+    if (payload_size <= 0) {
+        return message;
+    }
 
     u8 *payload = (u8 *)malloc(payload_size);
     int ncopied = 0;
     
     nread -= 5; // Length and ID.
-    memcpy(payload, ((u8 *)buf) + 5, nread);
-    ncopied += nread;
+    if (nread <= 0) {
+        return message;
+    }
+
+    int left = payload_size - ncopied;
+    int size = MIN(nread, left);
+    memcpy(payload, ((u8 *)buf) + 5, size);
+    // ncopied += nread;
+    ncopied += size;
 
     while (ncopied < payload_size) {
         // Keep reading data if it's not full in the first call (given by length).
@@ -975,17 +993,17 @@ Message *receive_message(TCPClient *client)
         nread = 0;
         res = receive_data(client, buf, sizeof(buf), &nread);
         if (res != CURLE_OK) {
-            fprintf(stderr, "ERROR: could not receive request response\n");
             return NULL;
         }
 
-        memcpy(payload + ncopied, buf, nread);
-        ncopied += nread;
+        left = payload_size - ncopied;
+        size = MIN(nread, left);
+        memcpy(payload + ncopied, buf, size);
+        // ncopied += nread;
+        ncopied += size;
     }
 
 
-    Message *message = (Message *)malloc(sizeof(Message));
-    message->id = id;
     message->payload = payload;
     message->payload_size = payload_size;
 
@@ -994,7 +1012,7 @@ Message *receive_message(TCPClient *client)
 
 Message *make_handshake(TCPClient *client, HandshakeData *handshake_data)
 {
-    printf("Making handshake...\n");
+    // printf("Making handshake...\n");
     
     CURLcode res;
 
@@ -1029,6 +1047,10 @@ Message *make_handshake(TCPClient *client, HandshakeData *handshake_data)
     
     u8 *bitfield_data = (buf + handshake_response.size);
     Message *bitfield = buffer_to_message(bitfield_data, nread - handshake_response.size);
+    if (bitfield == NULL) {
+        return NULL;
+    }
+
     if (bitfield->id != MESSAGE_ID_BITFIELD) {
         fprintf(stderr, "ERROR: id mismatch. Expected = %d, but got = %d\n", MESSAGE_ID_BITFIELD, bitfield->id);
         return NULL;
@@ -1036,7 +1058,7 @@ Message *make_handshake(TCPClient *client, HandshakeData *handshake_data)
 
     handshake_data_cleanup(&handshake_response);
 
-    printf("Handshake completed\n");
+    // printf("Handshake completed\n");
 
     return bitfield;
 }
@@ -1054,7 +1076,7 @@ void send_unchoke(TCPClient *client)
     
     CURLcode res = send_data(client, data, sizeof(data));
     if (res != CURLE_OK) {
-        fprintf(stderr, "ERROR: could not send unchoke\n");
+        fprintf(stderr, "ERROR: (%d) could not send unchoke\n", res);
     }
 }
 
@@ -1070,7 +1092,7 @@ void send_interested(TCPClient *client)
 
     CURLcode res = send_data(client, data, sizeof(data));
     if (res != CURLE_OK) {
-        fprintf(stderr, "ERROR: could not send interested\n");
+        fprintf(stderr, "ERROR: (%d) could not send interested\n", res);
     }
 }
 
@@ -1093,7 +1115,7 @@ void send_have(TCPClient *client, int piece_index)
 
     CURLcode res = send_data(client, data, sizeof(data));
     if (res != CURLE_OK) {
-        fprintf(stderr, "ERROR: could not send have\n");
+        fprintf(stderr, "ERROR: (%d) could not send have\n", res);
     }
 }
 
@@ -1114,7 +1136,7 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
     // printf("================================================\n");
     // printf("Download piece %d\n", piece_index);
 
-    int result = 0;
+    int result = 1;
 
     CURLcode res;
     int length = 13;
@@ -1124,7 +1146,8 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
     int remaining = piece_length;
     int downloaded = 0;
 
-    u8 piece_buf[piece_length];
+    // u8 piece_buf[piece_length];
+    u8 *piece_buf = (u8 *)malloc(piece_length);
     
     while (remaining > 0) {
         // printf("--------------------\n");
@@ -1146,7 +1169,7 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
         
             res = send_data(client, data, sizeof(data));
             if (res != CURLE_OK) {
-                fprintf(stderr, "ERROR: could not send request\n");
+                fprintf(stderr, "ERROR: (%d) could not send request\n", res);
                 return result;
             }
         }
@@ -1170,6 +1193,10 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
                 client->choked = false;
             } break;
             case MESSAGE_ID_PIECE: {
+                if (message->payload_size < 8) {
+                    return result;
+                }
+
                 int index = FROM_BIG_ENDIAN(*((int *)(message->payload + 0)));
                 int begin = FROM_BIG_ENDIAN(*((int *)(message->payload + 4)));
                 u8 *block = message->payload + 8;
@@ -1177,15 +1204,17 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
                 // printf("index = %d\n", index);
                 // printf("begin = %d\n", begin);
 
-                if (piece_index != index) {
-                    fprintf(stderr, "ERROR: piece index does not match. Requested = %d, but got %d\n", piece_index, index);
-                    return result;
-                }
-
-                if (byte_offset != begin) {
-                    fprintf(stderr, "ERROR: offset does not match. Requested = %d, but got %d\n", byte_offset, begin);
-                    return result;
-                }
+                // TODO: maybe skip this check and just take the index from the message as the correct one.
+                // if (piece_index != index) {
+                //     fprintf(stderr, "ERROR: piece index does not match. Requested = %d, but got %d\n", piece_index, index);
+                //     return result;
+                // }
+                
+                // if (byte_offset != begin) {
+                //     fprintf(stderr, "ERROR: offset does not match. Requested = %d, but got %d\n", byte_offset, begin);
+                //     return result;
+                // }
+                piece_index = index;
 
                 remaining -= block_size;
                 downloaded += block_size;
@@ -1193,13 +1222,15 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
                 memcpy(piece_buf + begin, block, block_size);
             } break;
         }
+
+        free_message(message);
     }
 
     u8 expected_hash[SHA_DIGEST_LENGTH];
     memcpy(expected_hash, torrent->piece_hashes + (piece_index * SHA_DIGEST_LENGTH), SHA_DIGEST_LENGTH);
 
     u8 hash_piece[SHA_DIGEST_LENGTH];
-    SHA1(piece_buf, sizeof(piece_buf), hash_piece);
+    SHA1(piece_buf, piece_length, hash_piece);
 
     if (memcmp(expected_hash, hash_piece, SHA_DIGEST_LENGTH) != 0) {
         fprintf(stderr, "ERROR: piece hash does not match the expected hash from torrent\n");
@@ -1210,8 +1241,11 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
 
     fseek(file, piece_index * torrent->piece_length, SEEK_SET);
     fwrite(piece_buf, 1, downloaded, file);
+    printf("Written into file.\n");
 
-    result = 1;
+    if (piece_buf) free(piece_buf);
+
+    result = 0;
     
     return result;
 }
@@ -1329,9 +1363,7 @@ peer_has_piece(Message *bitfield, int piece_index)
     return result;
 }
 
-// TODO: maybe it could be better to connect to a peer and loop until gather all possible pieces.
-// Do the handshake once; if it's OK, loop while dequeue returns a value check if the peer has it. If it does, just download;
-// if not, enqueue the piece_index and keep trying with others.
+
 static void *
 attempt_download_thread(void *arg)
 {
@@ -1341,49 +1373,55 @@ attempt_download_thread(void *arg)
     WorkQueue *queue = args->queue;
     PeersList *peers_list = args->peers_list;
     
-
-    int piece_index;
-    while (dequeue(queue, &piece_index)) {
-        int peer_index = args->absolute_peer_index;
-        int downloaded = 0;
-        do {
-            peer_index = peer_index % peers_list->n;
-            Peer *peer = peers_list->peers + peer_index;
-    
-            HandshakeData handshake_data = create_handshake_data(torrent->info_hash, torrent->peer_id);
+    int peer_index = args->absolute_peer_index;
+    do {
+        Peer *peer = peers_list->peers + (peer_index % peers_list->n);
         
-            char url[MAX_URL_LENGTH];
-            snprintf(url, MAX_URL_LENGTH, "%.*s:%d", peer->ip.length, peer->ip.chars, peer->port);
-            
-            TCPClient client = new_tcp_client(url);
-            tcp_client_connect(&client);
-            if (client.connected) {
-                Message *bitfield_message = make_handshake(&client, &handshake_data);
-                if (bitfield_message != NULL) {
+        // char url[MAX_URL_LENGTH];
+        // snprintf(url, MAX_URL_LENGTH, "%.*s:%d", peer->ip.length, peer->ip.chars, peer->port);
+        char url[100];
+        snprintf(url, 100, "%.*s:%d", peer->ip.length, peer->ip.chars, peer->port);
+
+        HandshakeData handshake_data = create_handshake_data(torrent->info_hash, torrent->peer_id);
+    
+        TCPClient client = new_tcp_client(url);
+        tcp_client_connect(&client);
+        if (client.connected) {
+            Message *bitfield_message = make_handshake(&client, &handshake_data);
+            if (bitfield_message != NULL) {
+                send_unchoke(&client);
+                send_interested(&client);
+                
+                int piece_index;
+                while (dequeue(queue, &piece_index)) {
+                    int downloaded_err = 1;
                     if (peer_has_piece(bitfield_message, piece_index)) {
                         client.bitfield = bitfield_message->payload;
                         client.bitfield_size = bitfield_message->payload_size;
                         
-                        send_unchoke(&client);
-                        send_interested(&client);
-                        
-                        downloaded = download_piece(&client, torrent, file, piece_index);
+                        downloaded_err = download_piece(&client, torrent, file, piece_index);
+                    }
+                    
+                    if (downloaded_err) {
+                        enqueue(queue, piece_index);
+                        break;
                     }
                 }
             }
-            tcp_client_cleanup(&client);
-    
-            peer_index++;
-        } while (!downloaded);
-    }
+        }
+        tcp_client_cleanup(&client);
+
+        // If all the pieces from the peer was downloaded, or the connection/handshake failed, change the peer to continue the work.
+        peer_index++;
+    } while (queue->count > 0);
 
     return (void *)0;
 }
 
 int main(int argc, char **argv)
 {
-    // int ncores = (int)sysconf(_SC_NPROCESSORS_CONF);
-    int ncores = 1;
+    int ncores = (int)sysconf(_SC_NPROCESSORS_CONF);
+    // int ncores = 1;
     printf("Using ncores: %d\n", ncores);
 
     // char *torrent_filename = "test_data/kubuntu-24.04.2-desktop-amd64.iso.torrent";
@@ -1422,27 +1460,39 @@ int main(int argc, char **argv)
     }
     
 
-    pthread_t *threads = (pthread_t *)malloc(ncores * sizeof(pthread_t));
-
-    for (int i = 0; i < ncores; ++i) {
+    if (ncores == 1) {
         ThreadArgs args = {
             .file = file,
             .torrent = &torrent,
             .peers_list = &peers_list,
             .queue = &queue,
-            .absolute_peer_index = i, // Use the index as the first index to look for. If it does not have it, look in the next one.
+            .absolute_peer_index = 0, // Use the index as the first index to look for. If it does not have it, look in the next one.
         };
 
-        int res = pthread_create((threads + i), NULL, attempt_download_thread, &args);
-        if (res != 0) {
-            fprintf(stderr, "ERROR: Could not create thread %d\n", i);
+        attempt_download_thread((void *)&args);
+    } else {
+        pthread_t *threads = (pthread_t *)malloc(ncores * sizeof(pthread_t));
+    
+        for (int i = 0; i < ncores; ++i) {
+            ThreadArgs args = {
+                .file = file,
+                .torrent = &torrent,
+                .peers_list = &peers_list,
+                .queue = &queue,
+                .absolute_peer_index = i * 2, // Use the index as the first index to look for. If it does not have it, look in the next one.
+            };
+    
+            int res = pthread_create((threads + i), NULL, attempt_download_thread, &args);
+            if (res != 0) {
+                fprintf(stderr, "ERROR: Could not create thread %d\n", i);
+            }
         }
-    }
-
-    for (int i = 0; i < ncores; ++i) {
-        int res = pthread_join(threads[i], NULL);
-        if (res != 0) {
-            fprintf(stderr, "ERROr: Could not join thread\n");
+    
+        for (int i = 0; i < ncores; ++i) {
+            int res = pthread_join(threads[i], NULL);
+            if (res != 0) {
+                fprintf(stderr, "ERROr: Could not join thread\n");
+            }
         }
     }
 
