@@ -1116,26 +1116,120 @@ int get_piece_length(Torrent *torrent, int piece_index)
     return end - begin;
 }
 
-int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_index)
+
+typedef struct Piece {
+    u8 *data;
+    int data_size;
+    int index;
+} Piece;
+
+typedef struct DownloadedPiecesNode {
+    Piece piece;
+    struct DownloadedPiecesNode *next;
+} DownloadedPiecesNode;
+
+typedef struct DownloadedPieces {
+    DownloadedPiecesNode *first;
+    DownloadedPiecesNode *last;
+    int count;
+    pthread_mutex_t mutex;
+} DownloadedPieces;
+
+void downloaded_pieces_init(DownloadedPieces *queue)
+{
+    queue->count = 0;
+    
+    if (pthread_mutex_init(&queue->mutex, NULL)) {
+        fprintf(stderr, "ERROR: Could not initialize mutex\n");
+        exit(1);
+    }
+}
+
+void downloaded_pieces_enqueue(DownloadedPieces *queue, Piece piece)
+{
+    if (pthread_mutex_lock(&queue->mutex)) {
+        fprintf(stderr, "ERROR: Could not acquire the mutex\n");
+        exit(1);
+    }
+
+    DownloadedPiecesNode *old_last = queue->last;
+    queue->last = (DownloadedPiecesNode *)malloc(sizeof(DownloadedPiecesNode));
+    queue->last->piece = piece;
+    
+    if (queue->count == 0) {
+        queue->first = queue->last;
+    } else {
+        old_last->next = queue->last;
+    }
+    
+    queue->count++;
+    
+    if (pthread_mutex_unlock(&queue->mutex)) {
+        fprintf(stderr, "ERROR: Could not release the mutex\n");
+        exit(1);
+    }
+}
+
+int downloaded_pieces_dequeue(DownloadedPieces *queue, Piece *value) {
+    if (pthread_mutex_lock(&queue->mutex)) {
+        fprintf(stderr, "ERROR: Could not acquire the mutex\n");
+        exit(1);
+    }
+
+    int result = 0;
+
+    if (queue->count != 0) {
+        *value = queue->first->piece;
+        DownloadedPiecesNode *old_first = queue->first;
+        queue->first = queue->first->next;
+        
+        free(old_first);
+    
+        queue->count--;
+        
+        result = 1;
+    }
+
+    if (pthread_mutex_unlock(&queue->mutex)) {
+        fprintf(stderr, "ERROR: Could not release the mutex\n");
+        exit(1);
+    }
+
+    return result;
+}
+
+void downloaded_pieces_cleanup(DownloadedPieces *queue)
+{
+    // TODO: free in place instead of dequeueing the elements (overhead of reassigning pointers and mutex's locking).
+    while (queue->count > 0) {
+        Piece value;
+        downloaded_pieces_dequeue(queue, &value);
+    }
+
+    if (pthread_mutex_destroy(&queue->mutex)) {
+        fprintf(stderr, "ERROR: Could not destroy mutex\n");
+    }
+}
+
+
+int download_piece(TCPClient *client, int piece_index, int piece_length, DownloadedPieces *downloaded_pieces)
 {
     int result = 1;
 
     CURLcode res;
-    int length = 13;
-
-    int piece_length = get_piece_length(torrent, piece_index);
     
     int remaining = piece_length;
     int downloaded = 0;
-
+    
     u8 *piece_buf = (u8 *)malloc(piece_length);
     Message *message = NULL;
     
     while (remaining > 0) {
         int byte_offset = downloaded;
         int piece_request_size = MAX_REQUEST_SIZE;
-
+        
         if (!client->choked) {
+            int length = 13;
             u8 data[17];
             *((u32 *)data) = TO_BIG_ENDIAN(length);
             data[4] = MESSAGE_ID_REQUEST;
@@ -1184,6 +1278,28 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
         }
     }
 
+
+    Piece piece = {
+        .data = piece_buf,
+        .data_size = piece_length,
+        .index = piece_index,
+    };
+    downloaded_pieces_enqueue(downloaded_pieces, piece);
+
+    result = 0;
+
+download_piece_cleanup:
+    free_message(message);
+
+    return result;
+}
+
+int validate(Torrent *torrent, Piece piece)
+{
+    int piece_index = piece.index;
+    u8 *piece_buf = piece.data;
+    int piece_length = piece.data_size;
+
     u8 expected_hash[SHA_DIGEST_LENGTH];
     memcpy(expected_hash, torrent->piece_hashes + (piece_index * SHA_DIGEST_LENGTH), SHA_DIGEST_LENGTH);
 
@@ -1192,22 +1308,10 @@ int download_piece(TCPClient *client, Torrent *torrent, FILE *file, int piece_in
 
     if (memcmp(expected_hash, hash_piece, SHA_DIGEST_LENGTH) != 0) {
         fprintf(stderr, "ERROR: piece hash does not match the expected hash from torrent\n");
-        return result;
+        return 1;
     }
-
-    send_have(client, piece_index);
-
-    fseek(file, piece_index * torrent->piece_length, SEEK_SET);
-    fwrite(piece_buf, 1, downloaded, file);
-
-    result = 0;
     
-download_piece_cleanup:
-    free_message(message);
-    if (piece_buf) free(piece_buf);
-
-    
-    return result;
+    return 0;
 }
 
 
@@ -1216,14 +1320,14 @@ typedef struct QueueNode {
     struct QueueNode *next;
 } QueueNode;
 
-typedef struct WorkQueue {
+typedef struct Queue {
     QueueNode *first;
     QueueNode *last;
     int count;
     pthread_mutex_t mutex;
-} WorkQueue;
+} Queue;
 
-void init_work_queue(WorkQueue *queue)
+void init_work_queue(Queue *queue)
 {
     queue->count = 0;
     
@@ -1233,7 +1337,7 @@ void init_work_queue(WorkQueue *queue)
     }
 }
 
-void enqueue(WorkQueue *queue, int piece_index)
+void enqueue(Queue *queue, int piece_index)
 {
     if (pthread_mutex_lock(&queue->mutex)) {
         fprintf(stderr, "ERROR: Could not acquire the mutex\n");
@@ -1258,7 +1362,7 @@ void enqueue(WorkQueue *queue, int piece_index)
     }
 }
 
-int dequeue(WorkQueue *queue, int *value) {
+int dequeue(Queue *queue, int *value) {
     if (pthread_mutex_lock(&queue->mutex)) {
         fprintf(stderr, "ERROR: Could not acquire the mutex\n");
         exit(1);
@@ -1286,7 +1390,7 @@ int dequeue(WorkQueue *queue, int *value) {
     return result;
 }
 
-void cleanup_work_queue(WorkQueue *queue)
+void cleanup_work_queue(Queue *queue)
 {
     // TODO: free in place instead of dequeueing the elements (overhead of reassigning pointers and mutex's locking).
     while (queue->count > 0) {
@@ -1303,8 +1407,9 @@ typedef struct ThreadArgs {
     FILE *file;
     Torrent *torrent;
     PeersList *peers_list;
-    WorkQueue *queue;
+    Queue *queue;
     int absolute_peer_index;
+    DownloadedPieces *downloaded_pieces;
 } ThreadArgs;
 
 static bool
@@ -1324,14 +1429,74 @@ peer_has_piece(Message *bitfield, int piece_index)
 }
 
 
+// static void *
+// attempt_download_thread(void *arg)
+// {
+//     ThreadArgs *args = (ThreadArgs *)arg;
+//     FILE *file = args->file;
+//     Torrent *torrent = args->torrent;
+//     Queue *queue = args->queue;
+//     PeersList *peers_list = args->peers_list;
+    
+//     int peer_index = args->absolute_peer_index;
+
+//     do {
+//         Peer *peer = peers_list->peers + (peer_index % peers_list->n);
+        
+//         // char url[MAX_URL_LENGTH];
+//         // snprintf(url, MAX_URL_LENGTH, "%.*s:%d", peer->ip.length, peer->ip.chars, peer->port);
+//         char url[100];
+//         snprintf(url, 100, "%.*s:%d", peer->ip.length, peer->ip.chars, peer->port);
+
+//         HandshakeData handshake_data = create_handshake_data(torrent->info_hash, torrent->peer_id);
+    
+//         TCPClient client = new_tcp_client(url);
+//         tcp_client_connect(&client);
+//         if (client.connected) {
+//             Message *bitfield_message = make_handshake(&client, &handshake_data);
+//             if (bitfield_message != NULL) {
+//                 send_unchoke(&client);
+//                 send_interested(&client);
+                
+//                 for (int attempt = 0; attempt < 3; ++attempt) {
+//                     int piece_index;
+//                     while (dequeue(queue, &piece_index)) {
+//                         int downloaded_err = 1;
+//                         if (peer_has_piece(bitfield_message, piece_index)) {
+//                             client.bitfield = bitfield_message->payload;
+//                             client.bitfield_size = bitfield_message->payload_size;
+                            
+//                             downloaded_err = download_piece(&client, torrent, file, piece_index);
+//                         }
+                        
+//                         if (downloaded_err) {
+//                             enqueue(queue, piece_index);
+//                             break;
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+//         tcp_client_cleanup(&client);
+
+//         // If all the pieces from the peer was downloaded, or the connection/handshake failed, change the peer to continue the work.
+//         peer_index++;
+//     } while (queue->count > 0);
+
+//     return (void *)0;
+// }
+
+
 static void *
-attempt_download_thread(void *arg)
+download_thread(void *arg)
 {
     ThreadArgs *args = (ThreadArgs *)arg;
     FILE *file = args->file;
     Torrent *torrent = args->torrent;
-    WorkQueue *queue = args->queue;
+    Queue *queue = args->queue;
     PeersList *peers_list = args->peers_list;
+    DownloadedPieces *downloaded_pieces = args->downloaded_pieces;
+
     
     int peer_index = args->absolute_peer_index;
 
@@ -1361,7 +1526,9 @@ attempt_download_thread(void *arg)
                             client.bitfield = bitfield_message->payload;
                             client.bitfield_size = bitfield_message->payload_size;
                             
-                            downloaded_err = download_piece(&client, torrent, file, piece_index);
+                            int piece_length = get_piece_length(torrent, piece_index);
+
+                            downloaded_err = download_piece(&client, piece_index, piece_length, downloaded_pieces);
                         }
                         
                         if (downloaded_err) {
@@ -1381,10 +1548,46 @@ attempt_download_thread(void *arg)
     return (void *)0;
 }
 
+static void *
+consolidate_thread(void *arg)
+{
+    ThreadArgs *args = (ThreadArgs *)arg;
+    FILE *file = args->file;
+    Torrent *torrent = args->torrent;
+    Queue *queue = args->queue;
+    PeersList *peers_list = args->peers_list;
+    DownloadedPieces *downloaded_pieces = args->downloaded_pieces;
+
+    while (queue->count > 0) {
+        while (downloaded_pieces->count > 0) {
+            Piece piece;
+            if (downloaded_pieces_dequeue(downloaded_pieces, &piece)) {
+                int piece_index = piece.index;
+                u8 *piece_buf = piece.data;
+                int piece_length = piece.data_size;
+                
+                int res = validate(torrent, piece);
+                if (res) {
+                    enqueue(queue, piece_index);
+                } else {
+                    fseek(file, piece_index * torrent->piece_length, SEEK_SET);
+                    fwrite(piece_buf, 1, piece_length, file);
+                    
+                    // TODO: uncomment
+                    // send_have(client, piece_index);
+                }
+
+                if (piece.data) free(piece.data);
+            }
+        }
+    }
+}
+
+
 int main(int argc, char **argv)
 {
-    int ncores = (int)sysconf(_SC_NPROCESSORS_CONF);
-    // int ncores = 1;
+    // int ncores = (int)sysconf(_SC_NPROCESSORS_CONF);
+    int ncores = 1;
     printf("Using ncores: %d\n", ncores);
 
     // char *torrent_filename = "test_data/kubuntu-24.04.2-desktop-amd64.iso.torrent";
@@ -1404,12 +1607,15 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    WorkQueue queue;
+    Queue queue;
     init_work_queue(&queue);
 
     for (int piece_index = 0; piece_index < torrent.piece_count; ++piece_index) {
         enqueue(&queue, piece_index);
     }
+
+    DownloadedPieces downloaded_pieces;
+    downloaded_pieces_init(&downloaded_pieces);
 
 
     PeersList peers_list = get_peers(&torrent);
@@ -1418,7 +1624,6 @@ int main(int argc, char **argv)
     //     Peer peer = peers_list.peers[i];
     //     printf("ip = %.*s:%d\n", peer.ip.length, peer.ip.chars, peer.port);
     // }
-    
 
     if (ncores == 1) {
         ThreadArgs args = {
@@ -1427,33 +1632,55 @@ int main(int argc, char **argv)
             .peers_list = &peers_list,
             .queue = &queue,
             .absolute_peer_index = 0, // Use the index as the first index to look for. If it does not have it, look in the next one.
+            .downloaded_pieces = &downloaded_pieces,
         };
 
-        attempt_download_thread((void *)&args);
+        // attempt_download_thread((void *)&args);
+        pthread_t downloading_thread;
+        pthread_t consolidating_thread;
+
+        if (pthread_create(&downloading_thread, NULL, download_thread, &args) != 0) {
+            fprintf(stderr, "ERROR: Could not create thread\n");
+            exit(1);
+        }
+
+        if (pthread_create(&consolidating_thread, NULL, consolidate_thread, &args) != 0) {
+            fprintf(stderr, "ERROR: Could not create thread\n");
+            exit(1);
+        }
+
+
+        if (pthread_join(downloading_thread, NULL) != 0) {
+            fprintf(stderr, "ERROR: Could not join thread\n");
+        }
+
+        if (pthread_join(consolidating_thread, NULL) != 0) {
+            fprintf(stderr, "ERROR: Could not join thread\n");
+        }
     } else {
-        pthread_t *threads = (pthread_t *)malloc(ncores * sizeof(pthread_t));
+        // pthread_t *threads = (pthread_t *)malloc(ncores * sizeof(pthread_t));
     
-        for (int i = 0; i < ncores; ++i) {
-            ThreadArgs args = {
-                .file = file,
-                .torrent = &torrent,
-                .peers_list = &peers_list,
-                .queue = &queue,
-                .absolute_peer_index = i * 2, // Use the index as the first index to look for. If it does not have it, look in the next one.
-            };
+        // for (int i = 0; i < ncores; ++i) {
+        //     ThreadArgs args = {
+        //         .file = file,
+        //         .torrent = &torrent,
+        //         .peers_list = &peers_list,
+        //         .queue = &queue,
+        //         .absolute_peer_index = i * 2, // Use the index as the first index to look for. If it does not have it, look in the next one.
+        //     };
     
-            int res = pthread_create((threads + i), NULL, attempt_download_thread, &args);
-            if (res != 0) {
-                fprintf(stderr, "ERROR: Could not create thread %d\n", i);
-            }
-        }
+        //     int res = pthread_create((threads + i), NULL, attempt_download_thread, &args);
+        //     if (res != 0) {
+        //         fprintf(stderr, "ERROR: Could not create thread %d\n", i);
+        //     }
+        // }
     
-        for (int i = 0; i < ncores; ++i) {
-            int res = pthread_join(threads[i], NULL);
-            if (res != 0) {
-                fprintf(stderr, "ERROr: Could not join thread\n");
-            }
-        }
+        // for (int i = 0; i < ncores; ++i) {
+        //     int res = pthread_join(threads[i], NULL);
+        //     if (res != 0) {
+        //         fprintf(stderr, "ERROR: Could not join thread\n");
+        //     }
+        // }
     }
 
     fclose(file);
