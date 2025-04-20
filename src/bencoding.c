@@ -1387,6 +1387,8 @@ attempt_download_thread(void *arg)
     int peer_index = args->absolute_peer_index;
 
     do {
+        printf("queue->count = %d\n", queue->count);
+
         Peer *peer = peers_list->peers + (peer_index % peers_list->n);
         
         // char url[MAX_URL_LENGTH];
@@ -1511,6 +1513,8 @@ int main(int argc, char **argv)
     }
 
     fclose(file);
+
+    printf("Done\n");
 
     return 0;
 }
